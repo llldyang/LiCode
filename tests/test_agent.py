@@ -15,12 +15,13 @@ from Licode.agent import (
     NOTICE_MAX_ITER,
     NOTICE_STREAM_ERR,
     NOTICE_UNKNOWN_TOOLS,
+    PLAN_REMINDER_INTERVAL,
     Agent,
     Mode,
     Phase,
 )
 from Licode.conversation import Conversation
-from Licode.llm import Message, StreamEvent, ToolCall, ToolDefinition, Usage
+from Licode.llm import Message, Request, StreamEvent, ToolCall, ToolDefinition, Usage
 from Licode.tool import Registry, Result, new_default_registry
 
 
@@ -29,9 +30,9 @@ class FakeProvider:
         self.scripts = scripts
         self.repeat_last = repeat_last
         self.call_count = 0
+        self.requests: list[Request] = []
         self.histories: list[list[Message]] = []
         self.tool_definitions: list[list[ToolDefinition]] = []
-        self.system_suffixes: list[str] = []
 
     @property
     def name(self) -> str:
@@ -41,15 +42,10 @@ class FakeProvider:
     def model(self) -> str:
         return "fake-model"
 
-    async def stream(
-        self,
-        msgs: list[Message],
-        tools: list[ToolDefinition],
-        system_suffix: str = "",
-    ) -> AsyncIterator[StreamEvent]:
-        self.histories.append(msgs)
-        self.tool_definitions.append(tools)
-        self.system_suffixes.append(system_suffix)
+    async def stream(self, req: Request) -> AsyncIterator[StreamEvent]:
+        self.requests.append(req)
+        self.histories.append(req.messages)
+        self.tool_definitions.append(req.tools)
         index = self.call_count
         self.call_count += 1
         if self.repeat_last:
@@ -117,7 +113,7 @@ async def test_agent_runs_multiple_iterations_and_keeps_history(tmp_path: Path) 
 
     events = [
         event
-        async for event in Agent(provider, new_default_registry()).run(
+        async for event in Agent(provider, new_default_registry(), "test").run(
             conversation, Mode.NORMAL, asyncio.Event()
         )
     ]
@@ -147,7 +143,7 @@ async def test_agent_stops_at_iteration_limit() -> None:
 
     events = [
         event
-        async for event in Agent(provider, registry_with_probe()).run(
+        async for event in Agent(provider, registry_with_probe(), "test").run(
             conversation, Mode.NORMAL, asyncio.Event()
         )
     ]
@@ -169,7 +165,7 @@ async def test_agent_stops_after_consecutive_unknown_tools() -> None:
 
     events = [
         event
-        async for event in Agent(provider, Registry()).run(
+        async for event in Agent(provider, Registry(), "test").run(
             conversation, Mode.NORMAL, asyncio.Event()
         )
     ]
@@ -195,7 +191,7 @@ async def test_known_tool_resets_unknown_counter() -> None:
 
     events = [
         event
-        async for event in Agent(provider, registry_with_probe()).run(
+        async for event in Agent(provider, registry_with_probe(), "test").run(
             conversation, Mode.NORMAL, asyncio.Event()
         )
     ]
@@ -263,7 +259,9 @@ async def test_read_only_batch_is_concurrent_and_side_effect_follows() -> None:
 
     events = [
         event
-        async for event in Agent(provider, registry).run(conversation, Mode.NORMAL, asyncio.Event())
+        async for event in Agent(provider, registry, "test").run(
+            conversation, Mode.NORMAL, asyncio.Event()
+        )
     ]
 
     assert tracker.peak_reads >= 2
@@ -302,7 +300,7 @@ async def test_cancellation_completes_history_and_allows_next_turn() -> None:
     cancel = asyncio.Event()
     events = []
 
-    async for event in Agent(provider, registry).run(conversation, Mode.NORMAL, cancel):
+    async for event in Agent(provider, registry, "test").run(conversation, Mode.NORMAL, cancel):
         events.append(event)
         if event.tool and event.tool.phase is Phase.START:
             cancel.set()
@@ -320,7 +318,9 @@ async def test_cancellation_completes_history_and_allows_next_turn() -> None:
     conversation.add_user("继续")
     resumed = [
         event
-        async for event in Agent(provider, registry).run(conversation, Mode.NORMAL, asyncio.Event())
+        async for event in Agent(provider, registry, "test").run(
+            conversation, Mode.NORMAL, asyncio.Event()
+        )
     ]
     assert any(event.text == "取消后继续成功" for event in resumed)
     assert resumed[-1].done
@@ -335,7 +335,7 @@ async def test_stream_error_emits_error_and_keeps_history_valid() -> None:
 
     events = [
         event
-        async for event in Agent(provider, Registry()).run(
+        async for event in Agent(provider, Registry(), "test").run(
             conversation, Mode.NORMAL, asyncio.Event()
         )
     ]
@@ -353,7 +353,7 @@ async def test_plan_mode_only_exposes_read_only_tools() -> None:
 
     events = [
         event
-        async for event in Agent(provider, new_default_registry()).run(
+        async for event in Agent(provider, new_default_registry(), "test").run(
             conversation, Mode.PLAN, asyncio.Event()
         )
     ]
@@ -363,5 +363,72 @@ async def test_plan_mode_only_exposes_read_only_tools() -> None:
         "glob",
         "grep",
     ]
-    assert provider.system_suffixes == [prompt.PLAN_MODE_REMINDER]
+    request = provider.requests[0]
+    assert request.system.stable
+    assert request.system.environment
+    assert request.reminder == prompt.plan_reminder(True)
+    assert "<system-reminder>" in request.reminder
     assert events[-1].done
+
+
+@pytest.mark.asyncio
+async def test_plan_reminder_frequency_and_history_is_not_polluted() -> None:
+    scripts = [tool_event(f"call-{index}") for index in range(4)]
+    scripts.append([StreamEvent(text="计划完成"), StreamEvent(done=True)])
+    provider = FakeProvider(scripts)
+    conversation = Conversation()
+    conversation.add_user("制定多轮计划")
+
+    events = [
+        event
+        async for event in Agent(provider, registry_with_probe(), "test").run(
+            conversation, Mode.PLAN, asyncio.Event()
+        )
+    ]
+
+    assert PLAN_REMINDER_INTERVAL == 4
+    assert provider.requests[0].reminder == prompt.plan_reminder(True)
+    assert all(
+        request.reminder == prompt.plan_reminder(False) for request in provider.requests[1:4]
+    )
+    assert provider.requests[4].reminder == prompt.plan_reminder(True)
+    assert len({request.system.stable for request in provider.requests}) == 1
+    assert not any("<system-reminder>" in message.content for message in conversation.messages())
+    assert events[-1].done
+
+
+@pytest.mark.asyncio
+async def test_normal_and_plan_modes_share_stable_system_and_usage_cache_fields() -> None:
+    normal_provider = FakeProvider(
+        [[StreamEvent(usage=Usage(10, 2, cache_write=7, cache_read=3)), StreamEvent(done=True)]]
+    )
+    normal_conversation = Conversation()
+    normal_conversation.add_user("普通模式")
+    normal_events = [
+        event
+        async for event in Agent(normal_provider, new_default_registry(), "test").run(
+            normal_conversation, Mode.NORMAL, asyncio.Event()
+        )
+    ]
+    plan_provider = FakeProvider([[StreamEvent(text="计划"), StreamEvent(done=True)]])
+    plan_conversation = Conversation()
+    plan_conversation.add_user("规划模式")
+    _ = [
+        event
+        async for event in Agent(plan_provider, new_default_registry(), "test").run(
+            plan_conversation, Mode.PLAN, asyncio.Event()
+        )
+    ]
+
+    assert normal_provider.requests[0].system.stable == plan_provider.requests[0].system.stable
+    assert normal_provider.requests[0].reminder == ""
+    assert [definition.name for definition in normal_provider.requests[0].tools] == [
+        "read_file",
+        "write_file",
+        "edit_file",
+        "bash",
+        "glob",
+        "grep",
+    ]
+    usage = next(event.usage for event in normal_events if event.usage is not None)
+    assert (usage.input, usage.output, usage.cache_write, usage.cache_read) == (10, 2, 7, 3)

@@ -40,10 +40,12 @@ class ToolDefinition:
 
 @dataclass
 class Usage:
-    """一轮请求的输入与输出 token 用量。"""
+    """一轮请求的 token 用量与缓存命中信息。"""
 
     input_tokens: int = 0
     output_tokens: int = 0
+    cache_write: int = 0
+    cache_read: int = 0
 
 
 @dataclass
@@ -52,6 +54,24 @@ class Message:
     content: str = ""
     tool_calls: list[ToolCall] = field(default_factory=list)
     tool_results: list[ToolResult] = field(default_factory=list)
+
+
+@dataclass
+class System:
+    """分离稳定缓存块与动态环境块的系统上下文。"""
+
+    stable: str = ""
+    environment: str = ""
+
+
+@dataclass
+class Request:
+    """Provider 发起一轮流式请求所需的协议无关数据。"""
+
+    messages: list[Message] = field(default_factory=list)
+    tools: list[ToolDefinition] = field(default_factory=list)
+    system: System = field(default_factory=System)
+    reminder: str = ""
 
 
 @dataclass
@@ -72,12 +92,7 @@ class Provider(Protocol):
     @property
     def model(self) -> str: ...
 
-    def stream(
-        self,
-        msgs: list[Message],
-        tools: list[ToolDefinition],
-        system_suffix: str = "",
-    ) -> AsyncIterator[StreamEvent]: ...
+    def stream(self, req: Request) -> AsyncIterator[StreamEvent]: ...
 
 
 def new_provider(cfg: ProviderConfig) -> Provider:
@@ -100,7 +115,9 @@ __all__ = [
     "ROLE_USER",
     "Message",
     "Provider",
+    "Request",
     "StreamEvent",
+    "System",
     "ToolCall",
     "ToolDefinition",
     "ToolResult",

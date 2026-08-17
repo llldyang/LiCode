@@ -9,23 +9,17 @@ import anthropic
 from anthropic.types import ToolUseBlock
 
 from Licode.config import ProviderConfig
-from Licode.prompt import SYSTEM_PROMPT
 
 from . import (
     ROLE_ASSISTANT,
     ROLE_TOOL,
     Message,
+    Request,
     StreamEvent,
     ToolCall,
     ToolDefinition,
     Usage,
 )
-
-
-def _effective_system(system_suffix: str) -> str:
-    if not system_suffix:
-        return SYSTEM_PROMPT
-    return SYSTEM_PROMPT + "\n\n" + system_suffix
 
 
 def _to_anthropic_tools(tools: list[ToolDefinition]) -> list[dict[str, Any]]:
@@ -81,6 +75,24 @@ def _to_anthropic_messages(msgs: list[Message]) -> list[dict[str, Any]]:
     return messages
 
 
+def _append_reminder_anthropic(messages: list[dict[str, Any]], reminder: str) -> None:
+    """把 reminder 合并到末条 user 消息，保持 Anthropic 角色交替合法。"""
+
+    reminder_block = {"type": "text", "text": reminder}
+    if not messages or messages[-1]["role"] != "user":
+        messages.append({"role": "user", "content": [reminder_block]})
+        return
+    content = messages[-1].get("content", "")
+    if isinstance(content, list):
+        content.append(reminder_block)
+        return
+    blocks: list[dict[str, Any]] = []
+    if content:
+        blocks.append({"type": "text", "text": content})
+    blocks.append(reminder_block)
+    messages[-1]["content"] = blocks
+
+
 class AnthropicProvider:
     def __init__(self, cfg: ProviderConfig) -> None:
         self._client = anthropic.AsyncAnthropic(
@@ -99,21 +111,33 @@ class AnthropicProvider:
     def model(self) -> str:
         return self._model
 
-    async def stream(
-        self,
-        msgs: list[Message],
-        tools: list[ToolDefinition],
-        system_suffix: str = "",
-    ) -> AsyncIterator[StreamEvent]:
+    async def stream(self, req: Request) -> AsyncIterator[StreamEvent]:
+        system: list[dict[str, Any]] = []
+        if req.system.stable:
+            system.append(
+                {
+                    "type": "text",
+                    "text": req.system.stable,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            )
+        if req.system.environment:
+            system.append({"type": "text", "text": req.system.environment})
+        messages = _to_anthropic_messages(req.messages)
+        if req.reminder:
+            _append_reminder_anthropic(messages, req.reminder)
+
         params: dict[str, Any] = {
             "model": self._model,
             "max_tokens": 4096,
-            "system": _effective_system(system_suffix),
-            "messages": _to_anthropic_messages(msgs),
+            "system": system,
+            "messages": messages,
         }
-        if tools:
-            params["tools"] = _to_anthropic_tools(tools)
-        has_tool_history = any(message.tool_calls or message.tool_results for message in msgs)
+        if req.tools:
+            params["tools"] = _to_anthropic_tools(req.tools)
+        has_tool_history = any(
+            message.tool_calls or message.tool_results for message in req.messages
+        )
         if self._thinking and not has_tool_history:
             params["thinking"] = {"type": "enabled", "budget_tokens": 2048}
 
@@ -145,6 +169,9 @@ class AnthropicProvider:
                     usage=Usage(
                         input_tokens=final_message.usage.input_tokens,
                         output_tokens=final_message.usage.output_tokens,
+                        cache_write=getattr(final_message.usage, "cache_creation_input_tokens", 0)
+                        or 0,
+                        cache_read=getattr(final_message.usage, "cache_read_input_tokens", 0) or 0,
                     )
                 )
             yield StreamEvent(done=True)

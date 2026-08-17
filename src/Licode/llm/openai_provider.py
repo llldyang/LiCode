@@ -9,12 +9,11 @@ from openai import AsyncStream
 from openai.types.chat import ChatCompletionChunk, ChatCompletionMessageParam
 
 from Licode.config import ProviderConfig
-from Licode.prompt import SYSTEM_PROMPT
 
 from . import (
     ROLE_ASSISTANT,
     ROLE_TOOL,
-    Message,
+    Request,
     StreamEvent,
     ToolCall,
     ToolDefinition,
@@ -36,14 +35,12 @@ def _to_openai_tools(tools: list[ToolDefinition]) -> list[dict[str, Any]]:
     ]
 
 
-def _to_openai_messages(
-    msgs: list[Message], system_suffix: str
-) -> list[ChatCompletionMessageParam]:
-    system = SYSTEM_PROMPT
-    if system_suffix:
-        system += "\n\n" + system_suffix
+def _to_openai_messages(req: Request) -> list[ChatCompletionMessageParam]:
+    system = req.system.stable
+    if req.system.environment:
+        system += "\n\n" + req.system.environment
     messages: list[dict[str, Any]] = [{"role": "system", "content": system}]
-    for message in msgs:
+    for message in req.messages:
         if message.role == ROLE_TOOL:
             messages.extend(
                 {
@@ -74,6 +71,8 @@ def _to_openai_messages(
             )
             continue
         messages.append({"role": message.role, "content": message.content})
+    if req.reminder:
+        messages.append({"role": "user", "content": req.reminder})
     return cast(list[ChatCompletionMessageParam], messages)
 
 
@@ -94,20 +93,15 @@ class OpenAIProvider:
     def model(self) -> str:
         return self._model
 
-    async def stream(
-        self,
-        msgs: list[Message],
-        tools: list[ToolDefinition],
-        system_suffix: str = "",
-    ) -> AsyncIterator[StreamEvent]:
+    async def stream(self, req: Request) -> AsyncIterator[StreamEvent]:
         params: dict[str, Any] = {
             "model": self._model,
-            "messages": _to_openai_messages(msgs, system_suffix),
+            "messages": _to_openai_messages(req),
             "stream": True,
             "stream_options": {"include_usage": True},
         }
-        if tools:
-            params["tools"] = _to_openai_tools(tools)
+        if req.tools:
+            params["tools"] = _to_openai_tools(req.tools)
         try:
             stream = cast(
                 AsyncStream[ChatCompletionChunk],
@@ -122,6 +116,12 @@ class OpenAIProvider:
                             usage=Usage(
                                 input_tokens=chunk.usage.prompt_tokens,
                                 output_tokens=chunk.usage.completion_tokens,
+                                cache_read=getattr(
+                                    getattr(chunk.usage, "prompt_tokens_details", None),
+                                    "cached_tokens",
+                                    0,
+                                )
+                                or 0,
                             )
                         )
                     continue

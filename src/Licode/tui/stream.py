@@ -20,7 +20,7 @@ async def consume_stream(app: "LiCodeApp") -> None:
             raise RuntimeError("尚未选择 provider")
         if app.turn_cancel is None:
             raise RuntimeError("本轮取消事件尚未初始化")
-        agent = Agent(app.provider, app._tool_registry)
+        agent = Agent(app.provider, app._tool_registry, app.version)
         async for event in agent.run(app.conv, app.mode, app.turn_cancel):
             if event.err is not None:
                 rendered_error = error_block(event.err)

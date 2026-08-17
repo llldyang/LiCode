@@ -17,7 +17,10 @@ class BashTool:
         return "bash"
 
     def description(self) -> str:
-        return "在当前工作目录执行 shell 命令，返回退出码、标准输出和标准错误。"
+        return (
+            "在当前工作目录执行 shell 命令，返回退出码、标准输出和标准错误。"
+            "读文件、找文件、搜内容请优先用 read_file/glob/grep，不要用 bash 拼凑。"
+        )
 
     def parameters(self) -> dict[str, Any]:
         return {

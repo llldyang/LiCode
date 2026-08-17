@@ -9,12 +9,13 @@ from typing import Any
 
 from Licode import prompt
 from Licode.conversation import Conversation
-from Licode.llm import Provider, ToolCall, ToolDefinition, ToolResult
+from Licode.llm import Provider, Request, System, ToolCall, ToolDefinition, ToolResult
 from Licode.llm import Usage as LLMUsage
 from Licode.tool import DEFAULT_TIMEOUT, Registry, Result
 
 MAX_ITERATIONS: int = 25
 MAX_UNKNOWN_RUN: int = 3
+PLAN_REMINDER_INTERVAL: int = 4
 
 NOTICE_MAX_ITER = "（已达最大迭代轮数 25，自动停止；可继续发消息推进。）"
 NOTICE_UNKNOWN_TOOLS = "（连续多轮只请求到未注册的工具，自动停止。）"
@@ -35,10 +36,12 @@ class Mode(IntEnum):
 
 @dataclass
 class Usage:
-    """一轮请求的输入与输出 token 用量。"""
+    """一轮请求的 token 用量与缓存命中信息。"""
 
     input: int = 0
     output: int = 0
+    cache_write: int = 0
+    cache_read: int = 0
 
 
 @dataclass
@@ -68,19 +71,24 @@ class Event:
 class Agent:
     """循环调用模型与工具，直到任务完成或触发停止条件。"""
 
-    def __init__(self, provider: Provider, registry: Registry) -> None:
+    def __init__(self, provider: Provider, registry: Registry, version: str) -> None:
         self._provider = provider
         self._registry = registry
+        self._version = version
 
     async def run(
         self, conv: Conversation, mode: Mode, cancel: asyncio.Event
     ) -> AsyncIterator[Event]:
         if mode is Mode.PLAN:
             definitions = self._registry.read_only_definitions()
-            system_suffix = prompt.PLAN_MODE_REMINDER
         else:
             definitions = self._registry.definitions()
-            system_suffix = ""
+
+        environment = await asyncio.to_thread(
+            prompt.gather_environment, self._version, self._provider.model
+        )
+        stable_system = prompt.build_system_prompt()
+        environment_text = environment.render()
 
         unknown_run = 0
         for iteration in range(1, MAX_ITERATIONS + 1):
@@ -90,11 +98,17 @@ class Agent:
                 return
 
             stream_queue: asyncio.Queue[Event] = asyncio.Queue(maxsize=1)
+            reminder = ""
+            if mode is Mode.PLAN:
+                full = iteration == 1 or (iteration - 1) % PLAN_REMINDER_INTERVAL == 0
+                reminder = prompt.plan_reminder(full)
             stream_task = asyncio.create_task(
                 self._stream_once(
                     conv,
                     definitions,
-                    system_suffix,
+                    stable_system,
+                    environment_text,
+                    reminder,
                     cancel,
                     stream_queue.put,
                 )
@@ -111,7 +125,14 @@ class Agent:
                 self._ensure_assistant_tail(conv, fallback)
                 return
             if usage is not None:
-                yield Event(usage=Usage(usage.input_tokens, usage.output_tokens))
+                yield Event(
+                    usage=Usage(
+                        usage.input_tokens,
+                        usage.output_tokens,
+                        usage.cache_write,
+                        usage.cache_read,
+                    )
+                )
 
             if not calls:
                 final = text or EMPTY_FINAL
@@ -151,14 +172,22 @@ class Agent:
         self,
         conv: Conversation,
         definitions: list[ToolDefinition],
-        system_suffix: str,
+        stable_system: str,
+        environment_text: str,
+        reminder: str,
         cancel: asyncio.Event,
         push: Callable[[Event], Awaitable[None]],
     ) -> tuple[str, list[ToolCall], LLMUsage | None, bool]:
         text_parts: list[str] = []
         calls: list[ToolCall] = []
         usage: LLMUsage | None = None
-        stream = self._provider.stream(conv.messages(), definitions, system_suffix).__aiter__()
+        request = Request(
+            messages=conv.messages(),
+            tools=definitions,
+            system=System(stable=stable_system, environment=environment_text),
+            reminder=reminder,
+        )
+        stream = self._provider.stream(request).__aiter__()
 
         while not cancel.is_set():
             next_event: asyncio.Future[Any] = asyncio.ensure_future(anext(stream))
@@ -364,6 +393,7 @@ __all__ = [
     "NOTICE_MAX_ITER",
     "NOTICE_STREAM_ERR",
     "NOTICE_UNKNOWN_TOOLS",
+    "PLAN_REMINDER_INTERVAL",
     "Agent",
     "Event",
     "Mode",
