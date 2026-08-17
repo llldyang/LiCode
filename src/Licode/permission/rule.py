@@ -28,10 +28,14 @@ class RuleSet:
     def match_rule(self, friendly: str, target: str) -> tuple[Decision, Rule | None]:
         is_file = friendly != "Bash"
         for rule in self.deny:
-            if rule.tool == friendly and match_pattern(rule.pattern, target, is_file):
+            if match_pattern(rule.tool, friendly, is_file=False) and match_pattern(
+                rule.pattern, target, is_file
+            ):
                 return Decision.DENY, rule
         for rule in self.allow:
-            if rule.tool == friendly and match_pattern(rule.pattern, target, is_file):
+            if match_pattern(rule.tool, friendly, is_file=False) and match_pattern(
+                rule.pattern, target, is_file
+            ):
                 return Decision.ALLOW, rule
         return Decision.ALLOW, None
 

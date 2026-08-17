@@ -44,6 +44,17 @@ def test_same_layer_deny_precedes_allow() -> None:
     assert rules.match("Bash", "npm test") == (Decision.ALLOW, False)
 
 
+def test_external_tool_name_glob_matches_allow_and_deny() -> None:
+    rules = RuleSet(
+        allow=[Rule("mcp__demo__*", "", True)],
+        deny=[Rule("mcp__demo__remove", "", False)],
+    )
+
+    assert rules.match("mcp__demo__echo", "") == (Decision.ALLOW, True)
+    assert rules.match("mcp__demo__remove", "") == (Decision.DENY, True)
+    assert rules.match("mcp__other__echo", "") == (Decision.ALLOW, False)
+
+
 def test_settings_load_mapping_and_invalid_entries(tmp_path: Path) -> None:
     path = tmp_path / "settings.yaml"
     path.write_text(
