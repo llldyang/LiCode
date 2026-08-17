@@ -5,24 +5,28 @@ import os
 import time
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 
 from rich.console import Console, RenderableType
+from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.message import Message as TextualMessage
 from textual.timer import Timer
 from textual.widgets import OptionList, RichLog, Static, TextArea
 
-from Licode.agent import Mode
+from Licode.agent import ApprovalRequest
 from Licode.config import ProviderConfig
 from Licode.conversation import Conversation
 from Licode.llm import Provider, new_provider
+from Licode.permission import Engine, Mode, Outcome
 from Licode.prompt import EXECUTE_DIRECTIVE, render_banner
 from Licode.tool import Registry, new_default_registry
 
 from .select import provider_at, provider_options
 from .stream import consume_stream, tick
 from .view import (
+    approval_block,
     assistant_block,
     error_block,
     notice_block,
@@ -36,6 +40,7 @@ class SessionState(Enum):
     SELECTING = "selecting"
     IDLE = "idle"
     STREAMING = "streaming"
+    APPROVING = "approving"
 
 
 @dataclass
@@ -107,17 +112,25 @@ class LiCodeApp(App[None]):
     BINDINGS = [
         Binding("ctrl+c", "quit", "Quit", priority=True),
         Binding("escape", "cancel_turn", "Cancel", priority=True),
+        Binding("shift+tab", "cycle_mode", "Mode", priority=True),
     ]
 
-    def __init__(self, providers: list[ProviderConfig], version: str, registry: Registry) -> None:
+    def __init__(
+        self,
+        providers: list[ProviderConfig],
+        version: str,
+        registry: Registry,
+        engine: Engine,
+    ) -> None:
         super().__init__()
         self.state = SessionState.SELECTING if len(providers) > 1 else SessionState.IDLE
         self.providers = providers
         self.version = version
         self.provider: Provider | None = None
         self._tool_registry = registry
+        self.engine = engine
         self.conv = Conversation()
-        self.mode = Mode.NORMAL
+        self.mode = engine.start_mode()
         self.iter = 0
         self.usage_in = 0
         self.usage_out = 0
@@ -125,6 +138,8 @@ class LiCodeApp(App[None]):
         self.cur_tools: list[ToolDisplay] = []
         self.turn_cancel: asyncio.Event | None = None
         self.turn_start = 0.0
+        self.pending: ApprovalRequest | None = None
+        self.approve_cursor = 0
         self._stream_task: asyncio.Task[None] | None = None
         self._timer: Timer | None = None
         self._transcript: list[RenderableType] = []
@@ -187,7 +202,7 @@ class LiCodeApp(App[None]):
         history_text = text
         rendered_text = text
         if command == "/do":
-            self.mode = Mode.NORMAL
+            self.mode = Mode.DEFAULT
             history_text = EXECUTE_DIRECTIVE
             rendered_text = "/do"
             self._update_status_bar()
@@ -214,6 +229,11 @@ class LiCodeApp(App[None]):
         tick(self)
 
     def _refresh_streaming_view(self) -> None:
+        if self.state is SessionState.APPROVING and self.pending is not None:
+            self.query_one("#streaming", Static).update(
+                approval_block(self.pending, self.approve_cursor)
+            )
+            return
         if self.state is not SessionState.STREAMING:
             return
         elapsed = time.monotonic() - self.turn_start
@@ -235,8 +255,12 @@ class LiCodeApp(App[None]):
         self.cur_tools = []
         self.iter = 0
         self.turn_cancel = None
+        self.pending = None
+        message_input = self.query_one("#input", MessageInput)
+        message_input.disabled = False
         self.state = SessionState.IDLE
         self.query_one("#streaming", Static).update("")
+        message_input.focus()
         return elapsed
 
     def _finish_with_assistant(self, reply: str) -> None:
@@ -258,9 +282,8 @@ class LiCodeApp(App[None]):
             return
         self.query_one("#statusbar", Static).update(
             status_bar(
-                self.provider.name,
-                self.provider.model,
                 self.mode,
+                self.provider.model,
                 self.usage_in,
                 self.usage_out,
             )
@@ -274,7 +297,9 @@ class LiCodeApp(App[None]):
             console.print(renderable)
 
     async def action_quit(self) -> None:
-        if self.state is SessionState.STREAMING and self.turn_cancel is not None:
+        if self.state in {SessionState.STREAMING, SessionState.APPROVING}:
+            self._deny_pending()
+        if self.state in {SessionState.STREAMING, SessionState.APPROVING} and self.turn_cancel:
             self.turn_cancel.set()
             return
         if self._stream_task is not None:
@@ -286,13 +311,76 @@ class LiCodeApp(App[None]):
         self.exit()
 
     def action_cancel_turn(self) -> None:
-        if self.state is SessionState.STREAMING and self.turn_cancel is not None:
+        if self.state in {SessionState.STREAMING, SessionState.APPROVING}:
+            self._deny_pending()
+        if self.state in {SessionState.STREAMING, SessionState.APPROVING} and self.turn_cancel:
             self.turn_cancel.set()
+
+    def action_cycle_mode(self) -> None:
+        if self.state is not SessionState.IDLE:
+            return
+        self.mode = next_mode(self.mode)
+        rendered = notice_block(f"已切换到 {self.mode} 模式")
+        self.query_one("#log", RichLog).write(rendered)
+        self._transcript.append(rendered)
+        self._update_status_bar()
+
+    def on_key(self, event: events.Key) -> None:
+        if self.state is not SessionState.APPROVING:
+            return
+        key = event.key
+        if key in {"up", "k"}:
+            self.approve_cursor = (self.approve_cursor - 1) % 3
+        elif key in {"down", "j"}:
+            self.approve_cursor = (self.approve_cursor + 1) % 3
+        elif key in {"enter", "space"}:
+            self._resolve_approval(outcome_for_index(self.approve_cursor))
+        elif key in {"1", "2", "3"}:
+            self._resolve_approval(outcome_for_index(int(key) - 1))
+        elif key == "y":
+            self._resolve_approval(Outcome.ALLOW_ONCE)
+        elif key in {"n", "d"}:
+            self._resolve_approval(Outcome.DENY_ONCE)
+        else:
+            return
+        event.prevent_default()
+        event.stop()
+        self._refresh_streaming_view()
+
+    def _show_approval(self, request: ApprovalRequest) -> None:
+        self.pending = request
+        self.approve_cursor = 0
+        self.state = SessionState.APPROVING
+        self.query_one("#input", MessageInput).disabled = True
+        self.set_focus(None)
+        self._refresh_streaming_view()
+
+    def _resolve_approval(self, outcome: Outcome) -> None:
+        request = self.pending
+        self.pending = None
+        self.state = SessionState.STREAMING
+        self.query_one("#input", MessageInput).disabled = False
+        if request is not None and not request.respond.done():
+            request.respond.set_result(outcome)
+
+    def _deny_pending(self) -> None:
+        if self.pending is not None:
+            self._resolve_approval(Outcome.DENY_ONCE)
+
+
+def next_mode(mode: Mode) -> Mode:
+    return Mode((int(mode) + 1) % len(Mode))
+
+
+def outcome_for_index(index: int) -> Outcome:
+    return (Outcome.ALLOW_ONCE, Outcome.ALLOW_FOREVER, Outcome.DENY_ONCE)[index]
 
 
 def run(providers: list[ProviderConfig]) -> None:
     from Licode import __version__
+    from Licode.permission import new_engine
 
-    app = LiCodeApp(providers, __version__, new_default_registry())
+    engine, _ = new_engine(str(Path.cwd().resolve()))
+    app = LiCodeApp(providers, __version__, new_default_registry(), engine)
     app.run(inline=True, inline_no_clear=True)
     app.print_transcript()

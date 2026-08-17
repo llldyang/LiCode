@@ -1,17 +1,19 @@
 """用真实 provider 连续请求两轮并打印缓存用量。"""
 
 import asyncio
+from pathlib import Path
 
 from Licode import config
-from Licode.agent import Agent, Mode
+from Licode.agent import Agent
 from Licode.conversation import Conversation
 from Licode.llm import new_provider
+from Licode.permission import Mode, new_engine
 from Licode.tool import new_default_registry
 
 
 async def _run_turn(agent: Agent, conversation: Conversation, text: str) -> None:
     conversation.add_user(text)
-    async for event in agent.run(conversation, Mode.NORMAL, asyncio.Event()):
+    async for event in agent.run(conversation, Mode.BYPASS, asyncio.Event()):
         if event.text:
             print(event.text, end="", flush=True)
         if event.usage is not None:
@@ -28,7 +30,8 @@ async def _run_turn(agent: Agent, conversation: Conversation, text: str) -> None
 async def main() -> None:
     settings = config.load(".Licode/config.yaml")
     provider = new_provider(settings.providers[0])
-    agent = Agent(provider, new_default_registry(), "dev")
+    engine, _ = new_engine(str(Path.cwd().resolve()))
+    agent = Agent(provider, new_default_registry(), "dev", engine)
     conversation = Conversation()
     await _run_turn(agent, conversation, "请用一句话介绍你自己。")
     await _run_turn(agent, conversation, "请再用一句话概括你的工作方式。")

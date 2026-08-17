@@ -6,7 +6,8 @@ from rich.padding import Padding
 from rich.table import Table
 from rich.text import Text
 
-from Licode.agent import Mode
+from Licode.agent import ApprovalRequest
+from Licode.permission import Mode
 
 
 def user_block(text: str) -> Text:
@@ -72,6 +73,22 @@ def streaming_block(
     return Group(progress)
 
 
+def approval_block(request: ApprovalRequest, cursor: int) -> Group:
+    """渲染人在回路的三选一待批准块。"""
+
+    lines: list[Text] = [Text(f"● {request.name}", style="bold cyan")]
+    lines.append(Text("  " + request.args))
+    lines.append(Text("  " + request.reason, style="dim"))
+    lines.append(Text("是否继续?", style="bold"))
+    choices = ("1. 允许本次", "2. 永久允许（写入本地配置）", "3. 拒绝本次")
+    for index, choice in enumerate(choices):
+        prefix = "> " if index == cursor else "  "
+        style = "bold cyan" if index == cursor else ""
+        lines.append(Text(prefix + choice, style=style))
+    lines.append(Text("↑↓ 选择 · 回车确认 · Esc 取消", style="dim"))
+    return Group(*lines)
+
+
 def _compact_tokens(value: int) -> str:
     if value < 1000:
         return str(value)
@@ -80,15 +97,19 @@ def _compact_tokens(value: int) -> str:
 
 
 def status_bar(
-    name: str,
+    mode: Mode,
     model: str,
-    mode: Mode = Mode.NORMAL,
     usage_in: int = 0,
     usage_out: int = 0,
 ) -> Table:
-    left = Text(name, style="bold")
-    if mode is Mode.PLAN:
-        left.append("  PLAN", style="bold yellow")
+    labels = {
+        Mode.DEFAULT: ("DEFAULT", "bold green"),
+        Mode.ACCEPT_EDITS: ("ACCEPT EDITS", "bold cyan"),
+        Mode.PLAN: ("PLAN", "bold yellow"),
+        Mode.BYPASS: ("BYPASS", "bold red"),
+    }
+    label, style = labels[mode]
+    left = Text(label, style=style)
     right = Text(model, style="dim")
     right.append(
         f"  ↑{_compact_tokens(usage_in)} ↓{_compact_tokens(usage_out)} tok",

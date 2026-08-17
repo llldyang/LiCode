@@ -17,11 +17,12 @@ from Licode.agent import (
     NOTICE_UNKNOWN_TOOLS,
     PLAN_REMINDER_INTERVAL,
     Agent,
-    Mode,
+    ApprovalRequest,
     Phase,
 )
 from Licode.conversation import Conversation
 from Licode.llm import Message, Request, StreamEvent, ToolCall, ToolDefinition, Usage
+from Licode.permission import Decision, Engine, Mode, Outcome, new_engine
 from Licode.tool import Registry, Result, new_default_registry
 
 
@@ -84,6 +85,14 @@ def registry_with_probe() -> Registry:
     return registry
 
 
+def permission_engine(root: Path | None = None) -> Engine:
+    base = (root or Path.cwd()).resolve()
+    return Engine(
+        root=str(base),
+        local_path=str(base / ".Licode" / "settings.local.yaml"),
+    )
+
+
 @pytest.mark.asyncio
 async def test_agent_runs_multiple_iterations_and_keeps_history(tmp_path: Path) -> None:
     target = tmp_path / "note.txt"
@@ -113,9 +122,9 @@ async def test_agent_runs_multiple_iterations_and_keeps_history(tmp_path: Path) 
 
     events = [
         event
-        async for event in Agent(provider, new_default_registry(), "test").run(
-            conversation, Mode.NORMAL, asyncio.Event()
-        )
+        async for event in Agent(
+            provider, new_default_registry(), "test", permission_engine(tmp_path)
+        ).run(conversation, Mode.DEFAULT, asyncio.Event())
     ]
 
     assert [event.iter for event in events if event.iter] == [1, 2]
@@ -143,8 +152,8 @@ async def test_agent_stops_at_iteration_limit() -> None:
 
     events = [
         event
-        async for event in Agent(provider, registry_with_probe(), "test").run(
-            conversation, Mode.NORMAL, asyncio.Event()
+        async for event in Agent(provider, registry_with_probe(), "test", permission_engine()).run(
+            conversation, Mode.BYPASS, asyncio.Event()
         )
     ]
 
@@ -165,8 +174,8 @@ async def test_agent_stops_after_consecutive_unknown_tools() -> None:
 
     events = [
         event
-        async for event in Agent(provider, Registry(), "test").run(
-            conversation, Mode.NORMAL, asyncio.Event()
+        async for event in Agent(provider, Registry(), "test", permission_engine()).run(
+            conversation, Mode.BYPASS, asyncio.Event()
         )
     ]
 
@@ -191,8 +200,8 @@ async def test_known_tool_resets_unknown_counter() -> None:
 
     events = [
         event
-        async for event in Agent(provider, registry_with_probe(), "test").run(
-            conversation, Mode.NORMAL, asyncio.Event()
+        async for event in Agent(provider, registry_with_probe(), "test", permission_engine()).run(
+            conversation, Mode.BYPASS, asyncio.Event()
         )
     ]
 
@@ -259,8 +268,8 @@ async def test_read_only_batch_is_concurrent_and_side_effect_follows() -> None:
 
     events = [
         event
-        async for event in Agent(provider, registry, "test").run(
-            conversation, Mode.NORMAL, asyncio.Event()
+        async for event in Agent(provider, registry, "test", permission_engine()).run(
+            conversation, Mode.BYPASS, asyncio.Event()
         )
     ]
 
@@ -300,7 +309,9 @@ async def test_cancellation_completes_history_and_allows_next_turn() -> None:
     cancel = asyncio.Event()
     events = []
 
-    async for event in Agent(provider, registry, "test").run(conversation, Mode.NORMAL, cancel):
+    async for event in Agent(provider, registry, "test", permission_engine()).run(
+        conversation, Mode.BYPASS, cancel
+    ):
         events.append(event)
         if event.tool and event.tool.phase is Phase.START:
             cancel.set()
@@ -318,8 +329,8 @@ async def test_cancellation_completes_history_and_allows_next_turn() -> None:
     conversation.add_user("继续")
     resumed = [
         event
-        async for event in Agent(provider, registry, "test").run(
-            conversation, Mode.NORMAL, asyncio.Event()
+        async for event in Agent(provider, registry, "test", permission_engine()).run(
+            conversation, Mode.BYPASS, asyncio.Event()
         )
     ]
     assert any(event.text == "取消后继续成功" for event in resumed)
@@ -335,8 +346,8 @@ async def test_stream_error_emits_error_and_keeps_history_valid() -> None:
 
     events = [
         event
-        async for event in Agent(provider, Registry(), "test").run(
-            conversation, Mode.NORMAL, asyncio.Event()
+        async for event in Agent(provider, Registry(), "test", permission_engine()).run(
+            conversation, Mode.DEFAULT, asyncio.Event()
         )
     ]
 
@@ -353,7 +364,7 @@ async def test_plan_mode_only_exposes_read_only_tools() -> None:
 
     events = [
         event
-        async for event in Agent(provider, new_default_registry(), "test").run(
+        async for event in Agent(provider, new_default_registry(), "test", permission_engine()).run(
             conversation, Mode.PLAN, asyncio.Event()
         )
     ]
@@ -381,7 +392,7 @@ async def test_plan_reminder_frequency_and_history_is_not_polluted() -> None:
 
     events = [
         event
-        async for event in Agent(provider, registry_with_probe(), "test").run(
+        async for event in Agent(provider, registry_with_probe(), "test", permission_engine()).run(
             conversation, Mode.PLAN, asyncio.Event()
         )
     ]
@@ -406,18 +417,18 @@ async def test_normal_and_plan_modes_share_stable_system_and_usage_cache_fields(
     normal_conversation.add_user("普通模式")
     normal_events = [
         event
-        async for event in Agent(normal_provider, new_default_registry(), "test").run(
-            normal_conversation, Mode.NORMAL, asyncio.Event()
-        )
+        async for event in Agent(
+            normal_provider, new_default_registry(), "test", permission_engine()
+        ).run(normal_conversation, Mode.DEFAULT, asyncio.Event())
     ]
     plan_provider = FakeProvider([[StreamEvent(text="计划"), StreamEvent(done=True)]])
     plan_conversation = Conversation()
     plan_conversation.add_user("规划模式")
     _ = [
         event
-        async for event in Agent(plan_provider, new_default_registry(), "test").run(
-            plan_conversation, Mode.PLAN, asyncio.Event()
-        )
+        async for event in Agent(
+            plan_provider, new_default_registry(), "test", permission_engine()
+        ).run(plan_conversation, Mode.PLAN, asyncio.Event())
     ]
 
     assert normal_provider.requests[0].system.stable == plan_provider.requests[0].system.stable
@@ -432,3 +443,151 @@ async def test_normal_and_plan_modes_share_stable_system_and_usage_cache_fields(
     ]
     usage = next(event.usage for event in normal_events if event.usage is not None)
     assert (usage.input, usage.output, usage.cache_write, usage.cache_read) == (10, 2, 7, 3)
+
+
+@pytest.mark.asyncio
+async def test_denied_and_allowed_read_results_keep_order_and_loop_continues(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    inside = root / "inside.txt"
+    outside = tmp_path / "outside.txt"
+    inside.write_text("inside", encoding="utf-8")
+    outside.write_text("outside", encoding="utf-8")
+    calls = [
+        ToolCall("denied", "read_file", json.dumps({"path": str(outside)})),
+        ToolCall("allowed", "read_file", json.dumps({"path": str(inside)})),
+    ]
+    provider = FakeProvider(
+        [
+            [StreamEvent(tool_calls=calls), StreamEvent(done=True)],
+            [StreamEvent(text="已根据结果继续"), StreamEvent(done=True)],
+        ]
+    )
+    conversation = Conversation()
+    conversation.add_user("读取两个文件")
+
+    outputs = [
+        output
+        async for output in Agent(
+            provider, new_default_registry(), "test", permission_engine(root)
+        ).run(conversation, Mode.DEFAULT, asyncio.Event())
+    ]
+
+    results = conversation.messages()[2].tool_results
+    assert [(result.tool_call_id, result.is_error) for result in results] == [
+        ("denied", True),
+        ("allowed", False),
+    ]
+    assert "项目目录之外" in results[0].content
+    assert "inside" in results[1].content
+    assert not any(isinstance(output, ApprovalRequest) for output in outputs)
+    assert provider.call_count == 2
+    assert conversation.messages()[-1].content == "已根据结果继续"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("outcome", "executed", "persisted"),
+    [
+        (Outcome.ALLOW_ONCE, True, False),
+        (Outcome.ALLOW_FOREVER, True, True),
+        (Outcome.DENY_ONCE, False, False),
+    ],
+)
+async def test_approval_three_choices(
+    tmp_path: Path,
+    outcome: Outcome,
+    executed: bool,
+    persisted: bool,
+) -> None:
+    target = tmp_path / f"choice-{outcome.name}.txt"
+    call = ToolCall(
+        "write",
+        "write_file",
+        json.dumps({"path": str(target), "content": "approved"}),
+    )
+    provider = FakeProvider(
+        [
+            [StreamEvent(tool_calls=[call]), StreamEvent(done=True)],
+            [StreamEvent(text="审批后继续"), StreamEvent(done=True)],
+        ]
+    )
+    engine = permission_engine(tmp_path)
+    conversation = Conversation()
+    conversation.add_user("写文件")
+    approvals: list[ApprovalRequest] = []
+
+    async for output in Agent(provider, new_default_registry(), "test", engine).run(
+        conversation, Mode.DEFAULT, asyncio.Event()
+    ):
+        if isinstance(output, ApprovalRequest):
+            approvals.append(output)
+            output.respond.set_result(outcome)
+
+    assert len(approvals) == 1
+    assert "需确认" in approvals[0].reason
+    assert target.exists() is executed
+    result = conversation.messages()[2].tool_results[0]
+    assert result.is_error is (not executed)
+    assert provider.call_count == 2
+    assert Path(engine.local_path).exists() is persisted
+    if persisted:
+        content = Path(engine.local_path).read_text(encoding="utf-8")
+        assert "Write(choice-ALLOW_FOREVER.txt)" in content
+        reloaded, error = new_engine(str(tmp_path))
+        assert error is None
+        assert reloaded.check(Mode.DEFAULT, call, False)[0] is Decision.ALLOW
+
+
+@pytest.mark.asyncio
+async def test_cancelling_task_while_waiting_for_approval_cleans_up(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "cancelled.txt"
+    call = ToolCall(
+        "write",
+        "write_file",
+        json.dumps({"path": str(target), "content": "must not exist"}),
+    )
+    provider = FakeProvider([[StreamEvent(tool_calls=[call]), StreamEvent(done=True)]])
+    conversation = Conversation()
+    conversation.add_user("等待审批")
+    cancel = asyncio.Event()
+    approval_seen = asyncio.Event()
+    approval: ApprovalRequest | None = None
+    current = asyncio.current_task()
+    baseline = {task for task in asyncio.all_tasks() if task is not current}
+
+    async def collect() -> None:
+        nonlocal approval
+        async for output in Agent(
+            provider, new_default_registry(), "test", permission_engine(tmp_path)
+        ).run(conversation, Mode.DEFAULT, cancel):
+            if isinstance(output, ApprovalRequest):
+                approval = output
+                approval_seen.set()
+
+    task = asyncio.create_task(collect())
+    await asyncio.wait_for(approval_seen.wait(), timeout=1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=1)
+    await asyncio.sleep(0)
+
+    assert approval is not None and approval.respond.cancelled()
+    assert not target.exists()
+    assert [message.role for message in conversation.messages()] == [
+        "user",
+        "assistant",
+        "tool",
+        "assistant",
+    ]
+    assert conversation.messages()[2].tool_results[0].content == NOTICE_CANCELLED
+    remaining = {
+        pending
+        for pending in asyncio.all_tasks()
+        if pending is not asyncio.current_task() and not pending.done()
+    }
+    assert remaining <= baseline

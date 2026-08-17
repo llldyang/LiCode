@@ -1,17 +1,21 @@
 """ReAct Agent 循环编排。"""
 
 import asyncio
+import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import Any
+from typing import Any, TypeVar
 
 from Licode import prompt
 from Licode.conversation import Conversation
 from Licode.llm import Provider, Request, System, ToolCall, ToolDefinition, ToolResult
 from Licode.llm import Usage as LLMUsage
+from Licode.permission import Decision, Engine, Mode, Outcome
 from Licode.tool import DEFAULT_TIMEOUT, Registry, Result
+
+logger = logging.getLogger(__name__)
 
 MAX_ITERATIONS: int = 25
 MAX_UNKNOWN_RUN: int = 3
@@ -27,11 +31,6 @@ EMPTY_FINAL = "（模型未生成文本答复。）"
 class Phase(IntEnum):
     START = 0
     END = 1
-
-
-class Mode(IntEnum):
-    NORMAL = 0
-    PLAN = 1
 
 
 @dataclass
@@ -68,17 +67,34 @@ class Event:
     err: Exception | None = None
 
 
+@dataclass
+class ApprovalRequest:
+    """人在回路审批请求及其单次响应通道。"""
+
+    name: str
+    args: str
+    reason: str
+    respond: asyncio.Future[Outcome]
+
+
+AgentOutput = Event | ApprovalRequest
+QueueItem = TypeVar("QueueItem")
+
+
 class Agent:
     """循环调用模型与工具，直到任务完成或触发停止条件。"""
 
-    def __init__(self, provider: Provider, registry: Registry, version: str) -> None:
+    def __init__(
+        self, provider: Provider, registry: Registry, version: str, engine: Engine
+    ) -> None:
         self._provider = provider
         self._registry = registry
         self._version = version
+        self._engine = engine
 
     async def run(
         self, conv: Conversation, mode: Mode, cancel: asyncio.Event
-    ) -> AsyncIterator[Event]:
+    ) -> AsyncIterator[AgentOutput]:
         if mode is Mode.PLAN:
             definitions = self._registry.read_only_definitions()
         else:
@@ -145,12 +161,23 @@ class Agent:
             conv.add_assistant_with_tool_calls(text, calls)
             unknown_run = unknown_run + 1 if self._all_unknown(calls) else 0
 
-            tool_queue: asyncio.Queue[Event] = asyncio.Queue(maxsize=1)
-            tool_task = asyncio.create_task(self._execute_batched(calls, cancel, tool_queue.put))
+            tool_queue: asyncio.Queue[AgentOutput] = asyncio.Queue(maxsize=1)
+            tool_task = asyncio.create_task(
+                self._execute_batched(calls, mode, cancel, tool_queue.put)
+            )
             try:
-                async for event in self._drain(tool_task, tool_queue):
-                    yield event
+                async for output in self._drain(tool_task, tool_queue):
+                    yield output
                 results, completed = await tool_task
+            except asyncio.CancelledError:
+                cancel.set()
+                try:
+                    results, _ = await asyncio.shield(tool_task)
+                except asyncio.CancelledError:
+                    raise
+                conv.add_tool_results(results)
+                self._ensure_assistant_tail(conv, NOTICE_CANCELLED)
+                raise
             finally:
                 await self._stop_task(tool_task)
             conv.add_tool_results(results)
@@ -231,8 +258,9 @@ class Agent:
     async def _execute_batched(
         self,
         calls: list[ToolCall],
+        mode: Mode,
         cancel: asyncio.Event,
-        push: Callable[[Event], Awaitable[None]],
+        push: Callable[[AgentOutput], Awaitable[None]],
     ) -> tuple[list[ToolResult], bool]:
         results: list[ToolResult | None] = [None] * len(calls)
         index = 0
@@ -247,15 +275,30 @@ class Agent:
                     end += 1
                 for call in calls[index:end]:
                     await push(self._start_event(call))
+                allowed: list[tuple[int, ToolCall]] = []
+                for call_index in range(index, end):
+                    decision, reason = self._engine.check(mode, calls[call_index], True)
+                    if decision is Decision.ALLOW:
+                        allowed.append((call_index, calls[call_index]))
+                    else:
+                        results[call_index] = ToolResult(
+                            tool_call_id=calls[call_index].id,
+                            content=reason or "只读工具调用未获权限",
+                            is_error=True,
+                        )
                 outcomes = await asyncio.gather(
-                    *(self._run_one(call, cancel) for call in calls[index:end])
+                    *(self._run_one(call, cancel) for _, call in allowed)
                 )
                 completed = True
-                for offset, (result, one_completed) in enumerate(outcomes):
-                    call_index = index + offset
-                    results[call_index] = self._tool_result(calls[call_index], result)
-                    await push(self._end_event(calls[call_index], result))
+                for (call_index, call), (result, one_completed) in zip(
+                    allowed, outcomes, strict=True
+                ):
+                    results[call_index] = self._tool_result(call, result)
                     completed = completed and one_completed
+                for call_index in range(index, end):
+                    stored_result = results[call_index]
+                    if stored_result is not None:
+                        await push(self._end_result_event(calls[call_index], stored_result))
                 if not completed:
                     self._fill_cancelled(results, calls, end)
                     return self._complete_results(results), False
@@ -264,15 +307,65 @@ class Agent:
 
             call = calls[index]
             await push(self._start_event(call))
-            result, completed = await self._run_one(call, cancel)
-            results[index] = self._tool_result(call, result)
-            await push(self._end_event(call, result))
+            decision, reason = self._engine.check(mode, call, False)
+            completed = True
+            if decision is Decision.DENY:
+                result = Result(reason, is_error=True)
+            elif decision is Decision.ALLOW:
+                result, completed = await self._run_one(call, cancel)
+            else:
+                try:
+                    outcome = await self._request_approval(call, reason, cancel, push)
+                except asyncio.CancelledError:
+                    result = Result(NOTICE_CANCELLED, is_error=True)
+                    completed = False
+                else:
+                    if outcome is Outcome.DENY_ONCE:
+                        result = Result("用户拒绝本次工具调用", is_error=True)
+                    else:
+                        if outcome is Outcome.ALLOW_FOREVER:
+                            try:
+                                self._engine.persist_local_allow(call)
+                            except Exception as exc:
+                                logger.warning("永久权限规则写入失败: %s", exc)
+                        result, completed = await self._run_one(call, cancel)
+            tool_result = self._tool_result(call, result)
+            results[index] = tool_result
+            await push(self._end_result_event(call, tool_result))
             index += 1
             if not completed:
                 self._fill_cancelled(results, calls, index)
                 return self._complete_results(results), False
 
         return self._complete_results(results), True
+
+    async def _request_approval(
+        self,
+        call: ToolCall,
+        reason: str,
+        cancel: asyncio.Event,
+        push: Callable[[AgentOutput], Awaitable[None]],
+    ) -> Outcome:
+        respond: asyncio.Future[Outcome] = asyncio.get_running_loop().create_future()
+        await push(
+            ApprovalRequest(
+                name=call.name,
+                args=self._preview(call.input),
+                reason=reason,
+                respond=respond,
+            )
+        )
+        cancelled = asyncio.create_task(cancel.wait())
+        waiters: set[asyncio.Future[Any]] = {respond, cancelled}
+        try:
+            done, _ = await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
+            if cancel.is_set() or respond not in done:
+                raise asyncio.CancelledError
+            return respond.result()
+        finally:
+            if not respond.done():
+                respond.cancel()
+            await self._stop_task(cancelled)
 
     async def _run_one(self, call: ToolCall, cancel: asyncio.Event) -> tuple[Result, bool]:
         if cancel.is_set():
@@ -302,17 +395,18 @@ class Agent:
         return Result(NOTICE_CANCELLED, is_error=True), False
 
     async def _drain(
-        self, task: asyncio.Future[Any], queue: asyncio.Queue[Event]
-    ) -> AsyncIterator[Event]:
+        self, task: asyncio.Future[Any], queue: asyncio.Queue[QueueItem]
+    ) -> AsyncIterator[QueueItem]:
         while not task.done() or not queue.empty():
             if not queue.empty():
                 yield queue.get_nowait()
                 continue
             queued = asyncio.create_task(queue.get())
-            done, _ = await asyncio.wait({task, queued}, return_when=asyncio.FIRST_COMPLETED)
-            if queued in done:
-                yield queued.result()
-            else:
+            try:
+                done, _ = await asyncio.wait({task, queued}, return_when=asyncio.FIRST_COMPLETED)
+                if queued in done:
+                    yield queued.result()
+            finally:
                 await self._stop_task(queued)
 
     def _all_unknown(self, calls: list[ToolCall]) -> bool:
@@ -355,6 +449,10 @@ class Agent:
             )
         )
 
+    @classmethod
+    def _end_result_event(cls, call: ToolCall, result: ToolResult) -> Event:
+        return cls._end_event(call, Result(result.content, result.is_error))
+
     @staticmethod
     def _tool_result(call: ToolCall, result: Result) -> ToolResult:
         return ToolResult(
@@ -386,18 +484,24 @@ class Agent:
                 await close()
 
 
+def new_agent(provider: Provider, registry: Registry, version: str, engine: Engine) -> Agent:
+    return Agent(provider, registry, version, engine)
+
+
 __all__ = [
     "MAX_ITERATIONS",
     "MAX_UNKNOWN_RUN",
+    "AgentOutput",
     "NOTICE_CANCELLED",
     "NOTICE_MAX_ITER",
     "NOTICE_STREAM_ERR",
     "NOTICE_UNKNOWN_TOOLS",
     "PLAN_REMINDER_INTERVAL",
+    "ApprovalRequest",
     "Agent",
     "Event",
-    "Mode",
     "Phase",
     "ToolEvent",
     "Usage",
+    "new_agent",
 ]

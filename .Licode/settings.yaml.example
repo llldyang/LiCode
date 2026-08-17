@@ -1,0 +1,15 @@
+# 权限配置按本地级 > 项目级 > 用户级生效；同层 deny 优先。
+# 用户级：~/.Licode/settings.yaml
+# 项目级：<root>/.Licode/settings.yaml
+# 本地级：<root>/.Licode/settings.local.yaml（已被 gitignore）
+default_mode: default
+permissions:
+  # 只读默认放行；allow 主要用于提前放行 Bash/Write。
+  allow:
+    - Bash(git *)
+    - Bash(pytest)
+  # deny 可进一步限制只读路径。
+  deny:
+    - Bash(rm *)
+    - Read(.env)
+    - Write(.env)
