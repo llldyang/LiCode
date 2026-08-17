@@ -2,8 +2,9 @@
 
 import sys
 
-from Licode import config
+from Licode import __version__, config
 from Licode.config import ConfigError
+from Licode.tool import new_default_registry
 from Licode.tui import LiCodeApp
 
 
@@ -15,7 +16,8 @@ def main() -> None:
         raise SystemExit(1) from None
 
     try:
-        app = LiCodeApp(cfg.providers)
+        registry = new_default_registry()
+        app = LiCodeApp(cfg.providers, __version__, registry)
         app.run(inline=True, inline_no_clear=True)
         app.print_transcript()
     except KeyboardInterrupt:

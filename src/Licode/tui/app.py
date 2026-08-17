@@ -3,6 +3,7 @@
 import asyncio
 import os
 import time
+from dataclasses import dataclass
 from enum import Enum
 
 from rich.console import Console, RenderableType
@@ -12,11 +13,11 @@ from textual.message import Message as TextualMessage
 from textual.timer import Timer
 from textual.widgets import OptionList, RichLog, Static, TextArea
 
-from Licode import __version__
 from Licode.config import ProviderConfig
 from Licode.conversation import Conversation
 from Licode.llm import Provider, new_provider
 from Licode.prompt import render_banner
+from Licode.tool import Registry, new_default_registry
 
 from .select import provider_at, provider_options
 from .stream import consume_stream, tick
@@ -27,6 +28,12 @@ class SessionState(Enum):
     SELECTING = "selecting"
     IDLE = "idle"
     STREAMING = "streaming"
+
+
+@dataclass
+class ToolDisplay:
+    name: str
+    args: str
 
 
 class MessageInput(TextArea):
@@ -91,13 +98,16 @@ class LiCodeApp(App[None]):
 
     BINDINGS = [Binding("ctrl+c", "quit", "Quit", priority=True)]
 
-    def __init__(self, providers: list[ProviderConfig]) -> None:
+    def __init__(self, providers: list[ProviderConfig], version: str, registry: Registry) -> None:
         super().__init__()
         self.state = SessionState.SELECTING if len(providers) > 1 else SessionState.IDLE
         self.providers = providers
+        self.version = version
         self.provider: Provider | None = None
+        self._tool_registry = registry
         self.conv = Conversation()
         self.cur_reply = ""
+        self._cur_tool: ToolDisplay | None = None
         self.turn_start = 0.0
         self._stream_task: asyncio.Task[None] | None = None
         self._timer: Timer | None = None
@@ -112,7 +122,7 @@ class LiCodeApp(App[None]):
         yield Static(id="statusbar")
 
     def on_mount(self) -> None:
-        banner = render_banner(__version__, os.getcwd())
+        banner = render_banner(self.version, os.getcwd())
         self.query_one("#log", RichLog).write(banner)
         self._transcript.append(banner)
         if len(self.providers) == 1:
@@ -161,9 +171,9 @@ class LiCodeApp(App[None]):
         self.state = SessionState.STREAMING
         self._refresh_streaming_view()
         self._timer = self.set_interval(0.1, self._tick)
-        self._stream_task = asyncio.create_task(self._consume_stream())
+        self._stream_task = asyncio.create_task(self._consume_agent_events())
 
-    async def _consume_stream(self) -> None:
+    async def _consume_agent_events(self) -> None:
         await consume_stream(self)
 
     def _tick(self) -> None:
@@ -173,7 +183,11 @@ class LiCodeApp(App[None]):
         if self.state is not SessionState.STREAMING:
             return
         elapsed = time.monotonic() - self.turn_start
-        self.query_one("#streaming", Static).update(streaming_block(self.cur_reply, elapsed))
+        tool_name = self._cur_tool.name if self._cur_tool else ""
+        tool_args = self._cur_tool.args if self._cur_tool else ""
+        self.query_one("#streaming", Static).update(
+            streaming_block(self.cur_reply, elapsed, tool_name, tool_args)
+        )
 
     def _finish_turn(self) -> float:
         elapsed = time.monotonic() - self.turn_start
@@ -181,6 +195,7 @@ class LiCodeApp(App[None]):
             self._timer.stop()
         self._timer = None
         self._stream_task = None
+        self._cur_tool = None
         self.state = SessionState.IDLE
         self.query_one("#streaming", Static).update("")
         return elapsed
@@ -190,7 +205,6 @@ class LiCodeApp(App[None]):
         rendered_reply = assistant_block(reply, elapsed)
         self.query_one("#log", RichLog).write(rendered_reply)
         self._transcript.append(rendered_reply)
-        self.conv.add_assistant(reply)
         self.cur_reply = ""
 
     def _finish_with_error(self, error: Exception) -> None:
@@ -218,6 +232,8 @@ class LiCodeApp(App[None]):
 
 
 def run(providers: list[ProviderConfig]) -> None:
-    app = LiCodeApp(providers)
+    from Licode import __version__
+
+    app = LiCodeApp(providers, __version__, new_default_registry())
     app.run(inline=True, inline_no_clear=True)
     app.print_transcript()
