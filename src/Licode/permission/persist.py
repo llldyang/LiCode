@@ -20,9 +20,14 @@ class PersistableEngine(Protocol):
 
 def rule_for(engine: PersistableEngine, call: ToolCall) -> tuple[Rule, str, bool]:
     target, is_file, ok = extract_target(call)
-    if not ok or not target:
-        return Rule("", "", False), "", False
     friendly = friendly_name(call.name)
+    if not ok:
+        if not call.name or friendly != call.name:
+            return Rule("", "", False), "", False
+        rule = Rule(friendly, "", True)
+        return rule, rule.render(), True
+    if not target:
+        return Rule("", "", False), "", False
     try:
         exact_target = project_relative(engine.root, target) if is_file else target
     except (OSError, ValueError):
