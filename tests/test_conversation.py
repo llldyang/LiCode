@@ -41,3 +41,15 @@ def test_tool_calls_and_results_keep_protocol_neutral_history() -> None:
     assert [message.role for message in messages] == ["user", "assistant", "tool", "assistant"]
     assert messages[1].tool_calls == [call]
     assert messages[2].tool_results == [result]
+
+
+def test_last_role_tracks_history_tail() -> None:
+    conversation = Conversation()
+    assert conversation.last_role() == ""
+
+    conversation.add_user("用户")
+    assert conversation.last_role() == "user"
+    conversation.add_tool_results([ToolResult(tool_call_id="call-1", content="结果")])
+    assert conversation.last_role() == "tool"
+    conversation.add_assistant("助手")
+    assert conversation.last_role() == "assistant"

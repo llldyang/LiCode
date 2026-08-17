@@ -20,6 +20,14 @@ def test_registry_exports_six_definitions_in_order() -> None:
     ]
     assert registry.get("read_file") is not None
     assert registry.get("missing") is None
+    assert [definition.name for definition in registry.read_only_definitions()] == [
+        "read_file",
+        "glob",
+        "grep",
+    ]
+    assert registry.is_read_only("read_file")
+    assert not registry.is_read_only("write_file")
+    assert not registry.is_read_only("missing")
 
 
 @pytest.mark.asyncio

@@ -11,7 +11,21 @@ from anthropic.types import ToolUseBlock
 from Licode.config import ProviderConfig
 from Licode.prompt import SYSTEM_PROMPT
 
-from . import ROLE_ASSISTANT, ROLE_TOOL, Message, StreamEvent, ToolCall, ToolDefinition
+from . import (
+    ROLE_ASSISTANT,
+    ROLE_TOOL,
+    Message,
+    StreamEvent,
+    ToolCall,
+    ToolDefinition,
+    Usage,
+)
+
+
+def _effective_system(system_suffix: str) -> str:
+    if not system_suffix:
+        return SYSTEM_PROMPT
+    return SYSTEM_PROMPT + "\n\n" + system_suffix
 
 
 def _to_anthropic_tools(tools: list[ToolDefinition]) -> list[dict[str, Any]]:
@@ -86,12 +100,15 @@ class AnthropicProvider:
         return self._model
 
     async def stream(
-        self, msgs: list[Message], tools: list[ToolDefinition]
+        self,
+        msgs: list[Message],
+        tools: list[ToolDefinition],
+        system_suffix: str = "",
     ) -> AsyncIterator[StreamEvent]:
         params: dict[str, Any] = {
             "model": self._model,
             "max_tokens": 4096,
-            "system": SYSTEM_PROMPT,
+            "system": _effective_system(system_suffix),
             "messages": _to_anthropic_messages(msgs),
         }
         if tools:
@@ -124,6 +141,12 @@ class AnthropicProvider:
                     ]
                     if calls:
                         yield StreamEvent(tool_calls=calls)
+                yield StreamEvent(
+                    usage=Usage(
+                        input_tokens=final_message.usage.input_tokens,
+                        output_tokens=final_message.usage.output_tokens,
+                    )
+                )
             yield StreamEvent(done=True)
         except asyncio.CancelledError:
             raise

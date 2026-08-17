@@ -39,6 +39,14 @@ class ToolDefinition:
 
 
 @dataclass
+class Usage:
+    """一轮请求的输入与输出 token 用量。"""
+
+    input_tokens: int = 0
+    output_tokens: int = 0
+
+
+@dataclass
 class Message:
     role: Literal["user", "assistant", "tool"]
     content: str = ""
@@ -48,10 +56,11 @@ class Message:
 
 @dataclass
 class StreamEvent:
-    """Provider 流中的正文、工具调用、结束或错误事件。"""
+    """Provider 流中的正文、工具调用、用量、结束或错误事件。"""
 
     text: str = ""
     tool_calls: list[ToolCall] = field(default_factory=list)
+    usage: Usage | None = None
     done: bool = False
     err: Exception | None = None
 
@@ -64,7 +73,10 @@ class Provider(Protocol):
     def model(self) -> str: ...
 
     def stream(
-        self, msgs: list[Message], tools: list[ToolDefinition]
+        self,
+        msgs: list[Message],
+        tools: list[ToolDefinition],
+        system_suffix: str = "",
     ) -> AsyncIterator[StreamEvent]: ...
 
 
@@ -92,5 +104,6 @@ __all__ = [
     "ToolCall",
     "ToolDefinition",
     "ToolResult",
+    "Usage",
     "new_provider",
 ]

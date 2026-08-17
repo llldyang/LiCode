@@ -11,7 +11,15 @@ from openai.types.chat import ChatCompletionChunk, ChatCompletionMessageParam
 from Licode.config import ProviderConfig
 from Licode.prompt import SYSTEM_PROMPT
 
-from . import ROLE_ASSISTANT, ROLE_TOOL, Message, StreamEvent, ToolCall, ToolDefinition
+from . import (
+    ROLE_ASSISTANT,
+    ROLE_TOOL,
+    Message,
+    StreamEvent,
+    ToolCall,
+    ToolDefinition,
+    Usage,
+)
 
 
 def _to_openai_tools(tools: list[ToolDefinition]) -> list[dict[str, Any]]:
@@ -28,8 +36,13 @@ def _to_openai_tools(tools: list[ToolDefinition]) -> list[dict[str, Any]]:
     ]
 
 
-def _to_openai_messages(msgs: list[Message]) -> list[ChatCompletionMessageParam]:
-    messages: list[dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
+def _to_openai_messages(
+    msgs: list[Message], system_suffix: str
+) -> list[ChatCompletionMessageParam]:
+    system = SYSTEM_PROMPT
+    if system_suffix:
+        system += "\n\n" + system_suffix
+    messages: list[dict[str, Any]] = [{"role": "system", "content": system}]
     for message in msgs:
         if message.role == ROLE_TOOL:
             messages.extend(
@@ -82,12 +95,16 @@ class OpenAIProvider:
         return self._model
 
     async def stream(
-        self, msgs: list[Message], tools: list[ToolDefinition]
+        self,
+        msgs: list[Message],
+        tools: list[ToolDefinition],
+        system_suffix: str = "",
     ) -> AsyncIterator[StreamEvent]:
         params: dict[str, Any] = {
             "model": self._model,
-            "messages": _to_openai_messages(msgs),
+            "messages": _to_openai_messages(msgs, system_suffix),
             "stream": True,
+            "stream_options": {"include_usage": True},
         }
         if tools:
             params["tools"] = _to_openai_tools(tools)
@@ -100,6 +117,13 @@ class OpenAIProvider:
             finish_reason: str | None = None
             async for chunk in stream:
                 if not chunk.choices:
+                    if chunk.usage is not None:
+                        yield StreamEvent(
+                            usage=Usage(
+                                input_tokens=chunk.usage.prompt_tokens,
+                                output_tokens=chunk.usage.completion_tokens,
+                            )
+                        )
                     continue
                 choice = chunk.choices[0]
                 finish_reason = choice.finish_reason or finish_reason

@@ -8,6 +8,8 @@ from . import Result
 
 
 class WriteFileTool:
+    read_only = False
+
     def name(self) -> str:
         return "write_file"
 
