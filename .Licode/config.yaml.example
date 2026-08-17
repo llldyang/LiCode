@@ -1,0 +1,13 @@
+providers:
+  - name: Claude
+    protocol: anthropic
+    model: claude-sonnet-4-5
+    api_key: "请填写 Anthropic API 密钥"
+    # base_url: https://api.anthropic.com
+    thinking: true
+
+  # - name: OpenAI
+  #   protocol: openai
+  #   model: gpt-5-mini
+  #   api_key: "请填写 OpenAI API 密钥"
+  #   base_url: https://api.openai.com/v1
