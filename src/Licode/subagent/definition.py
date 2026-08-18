@@ -43,6 +43,7 @@ class Definition:
     permission_mode: Mode = Mode.DEFAULT
     dont_ask: bool = False
     background: bool = False
+    isolation: str = ""
     system_prompt: str = ""
     file_path: str = ""
     source: Source = Source.BUILTIN

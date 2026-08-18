@@ -1,4 +1,6 @@
-from Licode.command import NopUI, Registry, register_builtins
+import pytest
+
+from Licode.command import NopUI, Registry, WorktreeSummary, register_builtins
 from Licode.permission import Mode
 
 
@@ -33,6 +35,40 @@ class RecordingUI(NopUI):
         return self.is_idle
 
 
+class StubWorktreeAccessor:
+    def __init__(self) -> None:
+        self.calls: list[tuple[object, ...]] = []
+        self.summaries = [WorktreeSummary("demo", "C:/repo/demo", "worktree-demo", False, True)]
+
+    async def create(self, name: str) -> tuple[str, str]:
+        self.calls.append(("create", name))
+        return "C:/repo/demo", "worktree-demo"
+
+    def list(self) -> list[WorktreeSummary]:
+        self.calls.append(("list",))
+        return self.summaries
+
+    async def enter(self, name: str) -> None:
+        self.calls.append(("enter", name))
+        self.summaries[0].active = True
+
+    async def exit(self, action: str, discard: bool) -> bool:
+        self.calls.append(("exit", action, discard))
+        return action == "remove"
+
+    async def remove(self, name: str, discard: bool) -> None:
+        self.calls.append(("remove", name, discard))
+
+
+class WorktreeUI(RecordingUI):
+    def __init__(self) -> None:
+        super().__init__()
+        self.accessor = StubWorktreeAccessor()
+
+    def worktree_accessor(self) -> StubWorktreeAccessor:
+        return self.accessor
+
+
 def builtins() -> Registry:
     registry = Registry()
     register_builtins(registry)
@@ -57,6 +93,7 @@ def test_register_builtins_all_registered() -> None:
         "session",
         "skill",
         "status",
+        "worktree",
     ]
 
 
@@ -112,5 +149,33 @@ async def test_help_prints_fourteen_sorted_commands() -> None:
     await command.handler(ui)
 
     lines = ui.printed[0].splitlines()
-    assert len(lines) == 14
+    assert len(lines) == 15
     assert [line.split()[0] for line in lines] == [f"/{item.name}" for item in builtins().visible()]
+
+
+async def test_handle_worktree_all_subcommands() -> None:
+    ui = WorktreeUI()
+    command = builtins().lookup("worktree")
+    assert command is not None and command.args_handler is not None
+
+    for args in (
+        "create demo",
+        "list",
+        "enter demo",
+        "exit --remove --discard",
+        "remove demo --discard",
+    ):
+        await command.args_handler(ui, args)
+
+    assert ("create", "demo") in ui.accessor.calls
+    assert ("enter", "demo") in ui.accessor.calls
+    assert ("exit", "remove", True) in ui.accessor.calls
+    assert ("remove", "demo", True) in ui.accessor.calls
+    assert any("[manual]" in line for line in ui.printed)
+
+
+async def test_handle_worktree_reports_unavailable() -> None:
+    command = builtins().lookup("worktree")
+    assert command is not None and command.args_handler is not None
+    with pytest.raises(RuntimeError, match="不可用"):
+        await command.args_handler(NopUI(), "list")

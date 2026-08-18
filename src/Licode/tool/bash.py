@@ -8,6 +8,7 @@ import subprocess
 from typing import Any
 
 from . import Result, _truncate
+from .ctx import resolve_path
 
 
 class BashTool:
@@ -42,6 +43,7 @@ class BashTool:
             if os.name == "nt":
                 process = await asyncio.create_subprocess_shell(
                     data["command"],
+                    cwd=resolve_path(""),
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
@@ -49,6 +51,7 @@ class BashTool:
             else:
                 process = await asyncio.create_subprocess_shell(
                     data["command"],
+                    cwd=resolve_path(""),
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     start_new_session=True,

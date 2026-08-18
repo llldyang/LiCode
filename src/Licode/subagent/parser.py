@@ -14,6 +14,7 @@ from .definition import Definition, Source
 UTF8_BOM = b"\xef\xbb\xbf"
 AGENT_NAME_REGEX = re.compile(r"^[A-Za-z][A-Za-z0-9\-_]{0,31}$")
 VALID_MODELS = {"inherit", "haiku", "sonnet", "opus"}
+VALID_ISOLATIONS = {"", "worktree"}
 
 
 def parse_frontmatter_and_body(data: bytes) -> tuple[dict[str, Any], str]:
@@ -96,6 +97,14 @@ def parse_definition(data: bytes, file_path: str, source: Source) -> Definition:
     if max_turns < 0:
         raise ValueError("maxTurns 不能小于 0")
 
+    isolation = str(frontmatter.get("isolation") or "").strip()
+    if isolation not in VALID_ISOLATIONS:
+        print(
+            f'unknown isolation "{isolation}" in {file_path}; defaulting to empty',
+            file=sys.stderr,
+        )
+        isolation = ""
+
     return Definition(
         name=name,
         description=description,
@@ -106,6 +115,7 @@ def parse_definition(data: bytes, file_path: str, source: Source) -> Definition:
         permission_mode=permission_mode,
         dont_ask=dont_ask,
         background=bool(frontmatter.get("background") or False),
+        isolation=isolation,
         system_prompt=body,
         file_path=file_path,
         source=source,

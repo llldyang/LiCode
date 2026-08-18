@@ -11,12 +11,13 @@ from .builtin_local import (
 from .builtin_prompt import handle_do, handle_review
 from .builtin_skill import handle_skill
 from .builtin_ui import handle_clear, handle_compact, handle_exit, handle_plan, handle_resume
+from .builtin_worktree import handle_worktree, handle_worktree_root
 from .command import Command, Kind
 from .registry import Registry
 
 
 def register_builtins(registry: Registry) -> None:
-    """一次性注册全部 14 条内置命令。"""
+    """一次性注册全部内置命令。"""
 
     commands = (
         Command("clear", "清空当前对话并开启新会话", Kind.UI, handle_clear),
@@ -33,6 +34,13 @@ def register_builtins(registry: Registry) -> None:
         Command("session", "显示当前会话信息", Kind.LOCAL, handle_session),
         Command("skill", "列出已加载的 Skill", Kind.LOCAL, handle_skill),
         Command("status", "显示 LiCode 运行状态", Kind.LOCAL, handle_status),
+        Command(
+            "worktree",
+            "管理 Git Worktree 隔离目录",
+            Kind.LOCAL,
+            handle_worktree_root,
+            args_handler=handle_worktree,
+        ),
     )
     for command in commands:
         registry.register(command)

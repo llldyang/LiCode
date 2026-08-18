@@ -4,7 +4,7 @@ import asyncio
 import os
 import sys
 from contextlib import suppress
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from Licode import (
@@ -18,6 +18,7 @@ from Licode import (
     skills,
     subagent,
     task,
+    worktree,
 )
 from Licode import mcp as mcp_client
 from Licode.agent import AgentTool, SessionRuntime
@@ -37,8 +38,10 @@ from Licode.tui import new_app
 async def _amain() -> int:
     writer: session.Writer | None = None
     cleanup_task: asyncio.Task[None] | None = None
+    worktree_sweep_task: asyncio.Task[list[str]] | None = None
     manager: mcp_client.Manager | None = None
     hook_engine: hook.Engine | None = None
+    worktree_mgr: worktree.Manager | None = None
     app = None
     try:
         cfg = config.load(".Licode/config.yaml")
@@ -95,6 +98,16 @@ async def _amain() -> int:
             print(f"权限引擎降级: {engine_error}", file=sys.stderr)
         hook_engine = hook.load(root)
         subagent_catalog = subagent.load_catalog(root)
+        try:
+            worktree_mgr = worktree.Manager(root)
+        except Exception as exc:
+            print(f"Worktree 管理器降级: {exc}", file=sys.stderr)
+            worktree_mgr = None
+        else:
+            assert worktree_mgr is not None
+            worktree_sweep_task = asyncio.create_task(
+                worktree_mgr.sweep_stale(datetime.now() - timedelta(hours=24))
+            )
         task_mgr = task.Manager()
         for task_tool in (
             task.TaskListTool(task_mgr),
@@ -108,6 +121,7 @@ async def _amain() -> int:
             task_mgr,
             parent=None,
             bg_enabled=cfg.effective_enable_subagent_background(),
+            worktree_mgr=worktree_mgr,
         )
         registry.register(agent_tool)
         app = new_app(
@@ -127,6 +141,7 @@ async def _amain() -> int:
             task_mgr,
             subagent_catalog,
             agent_tool,
+            worktree_mgr,
         )
         await app.run_async(inline=True, inline_no_clear=True)
         app.print_transcript()
@@ -150,6 +165,9 @@ async def _amain() -> int:
         if cleanup_task is not None:
             with suppress(Exception):
                 await cleanup_task
+        if worktree_sweep_task is not None:
+            with suppress(Exception):
+                await worktree_sweep_task
     return 0
 
 

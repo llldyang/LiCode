@@ -7,3 +7,6 @@ __pycache__/
 .Licode/config.yaml
 .Licode/settings.local.yaml
 .Licode/sessions/
+# ch14: Worktree 隔离副本（仅供 SubAgent 与手动管理使用）
+.Licode/worktrees/
+.Licode/worktree_session.json

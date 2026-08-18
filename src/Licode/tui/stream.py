@@ -22,7 +22,7 @@ async def consume_stream(app: "LiCodeApp") -> None:
             raise RuntimeError("本轮取消事件尚未初始化")
         if app.agent is None:
             raise RuntimeError("Agent 尚未初始化")
-        async for event in app.agent.run(app.conv, app.mode(), app.turn_cancel):
+        async for event in app.run_agent_events():
             if isinstance(event, ApprovalRequest):
                 app._show_approval(event)
                 continue

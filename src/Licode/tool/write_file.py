@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from . import Result
+from .ctx import resolve_path
 
 
 class WriteFileTool:
@@ -37,7 +38,7 @@ class WriteFileTool:
         if not isinstance(data.get("content"), str):
             return Result(content="缺少字符串参数: content", is_error=True)
 
-        path = Path(data["path"])
+        path = Path(resolve_path(data["path"]))
         content = data["content"]
         try:
             path.parent.mkdir(parents=True, exist_ok=True)

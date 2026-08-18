@@ -319,7 +319,7 @@ async def test_compact_and_unknown_commands_do_not_enter_normal_chat(
         assert app.conv.length() == before
         assert "未知命令" in app._transcript[-1].plain
         assert "/help" in app._transcript[-1].plain
-        assert len(app.cmd_registry.visible()) == 14
+        assert len(app.cmd_registry.visible()) == 15
 
 
 @pytest.mark.asyncio
@@ -335,7 +335,7 @@ async def test_tui_dispatch_help_lists_all_builtins_without_llm(
 
         output = app._transcript[-1].plain
         lines = output.splitlines()
-        assert len(lines) == 14
+        assert len(lines) == 15
         assert [line.split()[0] for line in lines] == [
             f"/{command.name}" for command in app.cmd_registry.visible()
         ]
@@ -621,7 +621,7 @@ def test_completion_menu_filters_scrolls_and_handles_boundaries() -> None:
 
     menu.update("/", app_registry)
     assert menu.active
-    assert len(menu.items) == 14
+    assert len(menu.items) == 15
     assert len(menu.render(120).splitlines()) <= MAX_ROWS
 
     menu.update("/s", app_registry)
@@ -652,7 +652,7 @@ async def test_tui_completion_keys_execute_and_escape_preserves_input(
         await pilot.pause()
         app.input_area.text = "/"
         await pilot.pause()
-        assert app.completion.active and len(app.completion.items) == 14
+        assert app.completion.active and len(app.completion.items) == 15
         assert app.query_one("#completion", Static).styles.display == "block"
 
         app.input_area.text = "/s"

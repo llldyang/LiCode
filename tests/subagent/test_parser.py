@@ -14,7 +14,7 @@ def test_definition_fields() -> None:
     definition = parse_definition(
         definition_bytes(
             "tools: [read_file]\ndisallowedTools: [bash]\nmodel: sonnet\n"
-            "maxTurns: 7\npermissionMode: dontAsk\nbackground: true\n"
+            "maxTurns: 7\npermissionMode: dontAsk\nbackground: true\nisolation: worktree\n"
         ),
         "test.md",
         Source.PROJECT,
@@ -28,6 +28,7 @@ def test_definition_fields() -> None:
     assert definition.permission_mode is Mode.DEFAULT
     assert definition.dont_ask
     assert definition.background
+    assert definition.isolation == "worktree"
     assert definition.system_prompt == "正文"
     assert definition.file_path == "test.md"
     assert definition.source is Source.PROJECT
@@ -48,15 +49,22 @@ def test_invalid_required_frontmatter(raw: bytes) -> None:
 
 def test_invalid_fields_fallback(capsys: pytest.CaptureFixture[str]) -> None:
     definition = parse_definition(
-        definition_bytes("model: gpt-4\npermissionMode: strange\n"),
+        definition_bytes("model: gpt-4\npermissionMode: strange\nisolation: container\n"),
         "bad.md",
         Source.USER,
     )
     assert definition.model == "inherit"
     assert definition.permission_mode is Mode.DEFAULT
+    assert definition.isolation == ""
     captured = capsys.readouterr().err
     assert 'unknown model "gpt-4"' in captured
     assert 'unknown permissionMode "strange"' in captured
+    assert 'unknown isolation "container"' in captured
+
+
+def test_isolation_defaults_to_empty() -> None:
+    definition = parse_definition(definition_bytes(), "test.md", Source.USER)
+    assert definition.isolation == ""
 
 
 def test_parse_file_and_bom(tmp_path: Path) -> None:

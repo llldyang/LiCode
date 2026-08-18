@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from typing import TYPE_CHECKING
 
-from Licode.command import Kind, parse
+from Licode.command import Kind, parse_with_args
 
 if TYPE_CHECKING:
     from .app import LiCodeApp
@@ -14,7 +14,7 @@ if TYPE_CHECKING:
 async def dispatch_slash(app: LiCodeApp, text: str) -> bool:
     """分发斜杠命令，返回输入是否已按命令处理。"""
 
-    name, is_slash = parse(text)
+    name, args, is_slash = parse_with_args(text)
     if not is_slash:
         return False
 
@@ -26,7 +26,12 @@ async def dispatch_slash(app: LiCodeApp, text: str) -> bool:
         app.error("请等待当前任务完成")
     else:
         try:
-            await command.handler(app)
+            if args and command.args_handler is None:
+                app.error("该命令不接受参数")
+            elif command.args_handler is not None:
+                await command.args_handler(app, args)
+            else:
+                await command.handler(app)
             if command.kind is Kind.PROMPT:
                 await asyncio.sleep(0)
             if app._pending_command_task is not None:

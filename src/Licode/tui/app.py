@@ -3,6 +3,7 @@
 import asyncio
 import os
 import time
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -18,6 +19,7 @@ from textual.widgets import OptionList, RichLog, Static, TextArea
 
 from Licode.agent import (
     Agent,
+    AgentOutput,
     AgentTool,
     ApprovalRequest,
     CompactEvent,
@@ -55,8 +57,9 @@ from Licode.skills.executor import Executor
 from Licode.subagent import Catalog as SubagentCatalog
 from Licode.task import Manager as TaskManager
 from Licode.tool import Registry as ToolRegistry
-from Licode.tool import new_default_registry
+from Licode.tool import new_default_registry, with_cwd
 from Licode.tool.install_skill import InstallSkillTool
+from Licode.worktree import Manager as WorktreeManager
 
 from .commands import dispatch_slash
 from .complete import CompletionMenu, handle_completion_key
@@ -74,6 +77,7 @@ from .view import (
     streaming_block,
     user_block,
 )
+from .worktree_adapter import WorktreeAdapter
 
 
 class SessionState(Enum):
@@ -194,6 +198,7 @@ class LiCodeApp(App[None]):
         task_mgr: TaskManager | None = None,
         subagent_catalog: SubagentCatalog | None = None,
         agent_tool: AgentTool | None = None,
+        worktree_mgr: WorktreeManager | None = None,
     ) -> None:
         super().__init__()
         self.state = SessionState.SELECTING if len(providers) > 1 else SessionState.IDLE
@@ -217,6 +222,9 @@ class LiCodeApp(App[None]):
         self.task_mgr = task_mgr or TaskManager()
         self.subagent_catalog = subagent_catalog or SubagentCatalog()
         self.agent_tool = agent_tool
+        self.worktree_mgr = worktree_mgr
+        current_worktree = worktree_mgr.current_session() if worktree_mgr is not None else None
+        self.active_cwd = current_worktree.worktree_path if current_worktree is not None else ""
         self.foreground_sub_agent = None
         self._task_done_consumer: asyncio.Task[None] | None = None
         self._approval_consumer: asyncio.Task[None] | None = None
@@ -473,7 +481,7 @@ class LiCodeApp(App[None]):
         return self.provider.model if self.provider is not None else ""
 
     def cwd(self) -> str:
-        return self.workspace
+        return self._effective_cwd()
 
     def tool_count(self) -> int:
         return self._tool_registry.count()
@@ -570,6 +578,26 @@ class LiCodeApp(App[None]):
 
     def hook_rules(self) -> list[HookRule]:
         return self.hook_engine.rules if self.hook_engine is not None else []
+
+    def _set_active_cwd(self, path: str) -> None:
+        self.active_cwd = path
+
+    def _effective_cwd(self) -> str:
+        return self.active_cwd or str(Path.cwd())
+
+    def worktree_accessor(self) -> WorktreeAdapter | None:
+        if self.worktree_mgr is None:
+            return None
+        return WorktreeAdapter(self.worktree_mgr, self._set_active_cwd)
+
+    async def run_agent_events(self) -> AsyncIterator[AgentOutput]:
+        if self.agent is None:
+            raise RuntimeError("Agent 尚未初始化")
+        if self.turn_cancel is None:
+            raise RuntimeError("本轮取消事件尚未初始化")
+        with with_cwd(self._effective_cwd()):
+            async for event in self.agent.run(self.conv, self.mode(), self.turn_cancel):
+                yield event
 
     def _reload_skill_commands(self) -> None:
         remove_skill_commands(self.cmd_registry)

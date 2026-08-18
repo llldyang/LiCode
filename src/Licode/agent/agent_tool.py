@@ -18,8 +18,10 @@ from Licode.subagent import Definition
 from Licode.task import Manager, PartialState
 from Licode.tool import Result
 from Licode.tool.filter import FilterParams, apply_agent_tool_filter
+from Licode.worktree import Manager as WorktreeManager
 
 from . import Agent, AgentOutput, Event, Phase, SessionRuntime
+from .agent_worktree import execute_with_worktree
 from .context import current_agent, current_conversation
 from .fork import build_forked_messages, is_fork_context
 
@@ -84,11 +86,13 @@ class AgentTool:
         task_mgr: Manager,
         parent: Agent | None,
         bg_enabled: bool,
+        worktree_mgr: WorktreeManager | None = None,
     ) -> None:
         self.catalog = catalog
         self.task_mgr = task_mgr
         self.parent = parent
         self.bg_enabled = bg_enabled
+        self.worktree_mgr = worktree_mgr
 
     def set_parent(self, agent: Agent) -> None:
         self.parent = agent
@@ -206,7 +210,12 @@ class AgentTool:
         else:
             definition = self.catalog.fork_definition()
 
-        background = definition.background or parsed.run_in_background or definition.is_fork()
+        isolated = definition.isolation == "worktree"
+        if isolated and self.worktree_mgr is None:
+            return Result("worktree manager not configured", is_error=True)
+        background = (
+            definition.background or parsed.run_in_background or definition.is_fork()
+        ) and not isolated
         if background and not self.bg_enabled:
             return Result("background mode is disabled by config", is_error=True)
         allowed = self._allowed_tools(definition, background)
@@ -239,12 +248,27 @@ class AgentTool:
         events: asyncio.Queue[AgentOutput | None] = asyncio.Queue(maxsize=64)
         partial = PartialState()
         aggregator = asyncio.create_task(aggregate_partial(events, partial))
-        handle = asyncio.create_task(sub_agent.run_to_completion(sub_conv, task_for_run, events))
+        if isolated:
+            assert self.worktree_mgr is not None
+            run = execute_with_worktree(
+                self.worktree_mgr,
+                definition,
+                sub_agent,
+                sub_conv,
+                task_for_run,
+                events,
+            )
+        else:
+            run = sub_agent.run_to_completion(sub_conv, task_for_run, events)
+        handle = asyncio.create_task(run)
         adopted = False
         try:
-            final_text = await asyncio.wait_for(
-                asyncio.shield(handle), timeout=AUTO_BACKGROUND_SECONDS
-            )
+            if isolated:
+                final_text = await handle
+            else:
+                final_text = await asyncio.wait_for(
+                    asyncio.shield(handle), timeout=AUTO_BACKGROUND_SECONDS
+                )
         except TimeoutError:
             aggregator.cancel()
             try:

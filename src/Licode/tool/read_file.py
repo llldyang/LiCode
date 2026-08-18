@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from . import Result, _truncate
+from .ctx import resolve_path
 
 
 class ReadFileTool:
@@ -32,7 +33,7 @@ class ReadFileTool:
         if not isinstance(data, dict) or not isinstance(data.get("path"), str):
             return Result(content="缺少字符串参数: path", is_error=True)
 
-        path = Path(data["path"])
+        path = Path(resolve_path(data["path"]))
         if not path.exists():
             return Result(content=f"文件不存在: {path}", is_error=True)
         if path.is_dir():

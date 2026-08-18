@@ -1,10 +1,32 @@
 """命令处理函数可访问的最小 UI 协议。"""
 
+from dataclasses import dataclass
 from typing import Protocol
 
 from Licode.hook.rule import Rule as HookRule
 from Licode.permission import Mode
 from Licode.skills import SkillSummary
+
+
+@dataclass
+class WorktreeSummary:
+    name: str
+    path: str
+    branch: str
+    active: bool
+    manual: bool
+
+
+class WorktreeAccessor(Protocol):
+    async def create(self, name: str) -> tuple[str, str]: ...
+
+    def list(self) -> list[WorktreeSummary]: ...
+
+    async def enter(self, name: str) -> None: ...
+
+    async def exit(self, action: str, discard: bool) -> bool: ...
+
+    async def remove(self, name: str, discard: bool) -> None: ...
 
 
 class UI(Protocol):
@@ -55,6 +77,8 @@ class UI(Protocol):
     def hook_sources(self) -> list[str]: ...
 
     def hook_rules(self) -> list[HookRule]: ...
+
+    def worktree_accessor(self) -> WorktreeAccessor | None: ...
 
 
 class NopUI:
@@ -131,3 +155,6 @@ class NopUI:
 
     def hook_rules(self) -> list[HookRule]:
         return []
+
+    def worktree_accessor(self) -> WorktreeAccessor | None:
+        return None

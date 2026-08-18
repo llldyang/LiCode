@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from . import Result
+from .ctx import resolve_path
 
 
 class GlobTool:
@@ -38,7 +39,7 @@ class GlobTool:
         if "path" in data and not isinstance(data["path"], str):
             return Result(content="参数 path 必须是字符串", is_error=True)
 
-        root = Path(data.get("path") or ".")
+        root = Path(resolve_path(data.get("path") or "."))
         if not root.is_dir():
             return Result(content=f"搜索目录不存在: {root}", is_error=True)
         matches: list[str] = []

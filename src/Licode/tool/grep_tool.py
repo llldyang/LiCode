@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from . import Result
+from .ctx import resolve_path
 
 MAX_LINE_LENGTH = 1024 * 1024
 
@@ -48,7 +49,7 @@ class GrepTool:
         except re.error as exc:
             return Result(content=f"正则非法: {exc}", is_error=True)
 
-        root = Path(data.get("path") or ".")
+        root = Path(resolve_path(data.get("path") or "."))
         if not root.exists():
             return Result(content=f"搜索路径不存在: {root}", is_error=True)
         files: Iterable[Path]

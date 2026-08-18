@@ -20,6 +20,7 @@ class Kind(Enum):
 
 
 Handler = Callable[["UI"], Awaitable[None]]
+ArgsHandler = Callable[["UI", str], Awaitable[None]]
 
 
 @dataclass(slots=True)
@@ -32,3 +33,4 @@ class Command:
     handler: Handler
     aliases: list[str] = field(default_factory=list)
     hidden: bool = False
+    args_handler: ArgsHandler | None = None

@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from . import Result
+from .ctx import resolve_path
 
 
 class EditFileTool:
@@ -45,7 +46,7 @@ class EditFileTool:
             if not isinstance(data.get(key), str):
                 return Result(content=f"缺少字符串参数: {key}", is_error=True)
 
-        path = Path(data["path"])
+        path = Path(resolve_path(data["path"]))
         try:
             content = path.read_text(encoding="utf-8", errors="replace")
         except OSError as exc:

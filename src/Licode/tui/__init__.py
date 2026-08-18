@@ -12,6 +12,7 @@ from Licode.subagent import Catalog as SubagentCatalog
 from Licode.task import Manager as TaskManager
 from Licode.tool import Registry
 from Licode.tool.install_skill import InstallSkillTool
+from Licode.worktree import Manager as WorktreeManager
 
 from .app import LiCodeApp, SessionState
 
@@ -33,6 +34,7 @@ def new_app(
     task_mgr: TaskManager | None = None,
     subagent_catalog: SubagentCatalog | None = None,
     agent_tool: AgentTool | None = None,
+    worktree_mgr: WorktreeManager | None = None,
 ) -> LiCodeApp:
     return LiCodeApp(
         providers,
@@ -51,6 +53,7 @@ def new_app(
         task_mgr,
         subagent_catalog,
         agent_tool,
+        worktree_mgr,
     )
 
 

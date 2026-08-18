@@ -48,6 +48,7 @@ def _truncate(value: str, max_lines: int, max_chars: int) -> str:
 
 
 # 注册中心反向引用上述基础类型，因此在这些类型定义后导入。
+from .ctx import cwd_from_ctx, resolve_path, with_cwd  # noqa: E402
 from .registry import Registry  # noqa: E402
 
 
@@ -79,9 +80,12 @@ __all__ = [
     "Registry",
     "Result",
     "Tool",
+    "cwd_from_ctx",
     "InstallSkillTool",
     "LoadSkillTool",
     "new_default_registry",
+    "resolve_path",
+    "with_cwd",
 ]
 
 
