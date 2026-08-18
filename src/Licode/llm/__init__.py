@@ -11,6 +11,10 @@ ROLE_ASSISTANT: Literal["assistant"] = "assistant"
 ROLE_TOOL: Literal["tool"] = "tool"
 
 
+class PromptTooLongError(Exception):
+    """Provider 上报上下文超出窗口时使用的统一哨兵异常。"""
+
+
 @dataclass
 class ToolCall:
     """协议无关地承载模型发起的一次工具调用。"""
@@ -69,7 +73,7 @@ class Request:
     """Provider 发起一轮流式请求所需的协议无关数据。"""
 
     messages: list[Message] = field(default_factory=list)
-    tools: list[ToolDefinition] = field(default_factory=list)
+    tools: list[ToolDefinition] | None = field(default_factory=list)
     system: System = field(default_factory=System)
     reminder: str = ""
 
@@ -115,6 +119,7 @@ __all__ = [
     "ROLE_USER",
     "Message",
     "Provider",
+    "PromptTooLongError",
     "Request",
     "StreamEvent",
     "System",

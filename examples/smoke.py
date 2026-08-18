@@ -4,7 +4,14 @@ import asyncio
 from pathlib import Path
 
 from Licode import config
-from Licode.agent import Agent
+from Licode.agent import Agent, SessionRuntime
+from Licode.compact import (
+    CompactCircuitBreaker,
+    ContentReplacementState,
+    RecoveryState,
+    new_session_context,
+)
+from Licode.config import effective_context_window
 from Licode.conversation import Conversation
 from Licode.llm import new_provider
 from Licode.permission import Mode, new_engine
@@ -31,7 +38,14 @@ async def main() -> None:
     settings = config.load(".Licode/config.yaml")
     provider = new_provider(settings.providers[0])
     engine, _ = new_engine(str(Path.cwd().resolve()))
-    agent = Agent(provider, new_default_registry(), "dev", engine)
+    runtime = SessionRuntime(
+        replacement=ContentReplacementState(),
+        recovery=RecoveryState(),
+        auto_tracking=CompactCircuitBreaker(),
+        session=new_session_context(str(Path.cwd())),
+        context_window=effective_context_window(settings.providers[0]),
+    )
+    agent = Agent(provider, new_default_registry(), "dev", engine, runtime=runtime)
     conversation = Conversation()
     await _run_turn(agent, conversation, "请用一句话介绍你自己。")
     await _run_turn(agent, conversation, "请再用一句话概括你的工作方式。")

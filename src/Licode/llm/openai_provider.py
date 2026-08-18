@@ -13,6 +13,7 @@ from Licode.config import ProviderConfig
 from . import (
     ROLE_ASSISTANT,
     ROLE_TOOL,
+    PromptTooLongError,
     Request,
     StreamEvent,
     ToolCall,
@@ -155,4 +156,16 @@ class OpenAIProvider:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            yield StreamEvent(err=exc)
+            if _is_prompt_too_long(exc):
+                wrapped = PromptTooLongError("openai prompt too long")
+                wrapped.__cause__ = exc
+                yield StreamEvent(err=wrapped)
+            else:
+                yield StreamEvent(err=exc)
+
+
+def _is_prompt_too_long(error: Exception) -> bool:
+    return isinstance(error, openai.BadRequestError) and (
+        getattr(error, "code", None) == "context_length_exceeded"
+        or "context_length_exceeded" in str(getattr(error, "body", ""))
+    )

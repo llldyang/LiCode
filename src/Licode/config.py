@@ -6,6 +6,11 @@ from typing import Any, Literal, cast
 
 import yaml
 
+from Licode.protocol_defaults import (
+    DEFAULT_ANTHROPIC_CONTEXT_WINDOW,
+    DEFAULT_OPENAI_CONTEXT_WINDOW,
+)
+
 
 class ConfigError(Exception):
     """配置无法读取或不满足约束。"""
@@ -19,6 +24,7 @@ class ProviderConfig:
     model: str
     base_url: str | None = None
     thinking: bool = False
+    context_window: int = 0
 
 
 @dataclass
@@ -59,6 +65,9 @@ def _from_dict(raw: Any) -> Config:
         thinking = item.get("thinking", False)
         if not isinstance(thinking, bool):
             raise ConfigError(f"providers[{index}].thinking 必须是布尔值")
+        context_window = item.get("context_window", 0)
+        if isinstance(context_window, bool) or not isinstance(context_window, int):
+            raise ConfigError(f"providers[{index}].context_window 必须是整数")
 
         result.append(
             ProviderConfig(
@@ -68,6 +77,7 @@ def _from_dict(raw: Any) -> Config:
                 model=model,
                 base_url=base_url.strip() if isinstance(base_url, str) else None,
                 thinking=thinking,
+                context_window=context_window,
             )
         )
     return Config(providers=result)
@@ -89,3 +99,13 @@ def load(path: str) -> Config:
     except yaml.YAMLError as exc:
         raise ConfigError(f"YAML 格式错误: {exc}") from exc
     return _from_dict(raw)
+
+
+def effective_context_window(provider: ProviderConfig) -> int:
+    """返回显式配置或当前协议的默认上下文窗口。"""
+
+    if provider.context_window > 0:
+        return provider.context_window
+    if provider.protocol == "openai":
+        return DEFAULT_OPENAI_CONTEXT_WINDOW
+    return DEFAULT_ANTHROPIC_CONTEXT_WINDOW

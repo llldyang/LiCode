@@ -1,19 +1,43 @@
 """ReAct Agent 循环编排。"""
 
 import asyncio
+import json
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass
-from enum import IntEnum
+from pathlib import Path
 from typing import Any, TypeVar
 
 from Licode import prompt
+from Licode.compact import (
+    CompactCircuitBreaker,
+    ContentReplacementState,
+    ManageInput,
+    ManageOutput,
+    RecoveryState,
+    TriggerKind,
+    manage_context,
+    new_session_context,
+)
+from Licode.compact.const import AUTO_SAFETY_MARGIN, MANUAL_SAFETY_MARGIN, SUMMARY_RESERVE
+from Licode.compact.token import estimate_tokens, usage_anchor
 from Licode.conversation import Conversation
-from Licode.llm import Provider, Request, System, ToolCall, ToolDefinition, ToolResult
+from Licode.llm import (
+    PromptTooLongError,
+    Provider,
+    Request,
+    System,
+    ToolCall,
+    ToolDefinition,
+    ToolResult,
+)
 from Licode.llm import Usage as LLMUsage
 from Licode.permission import Decision, Engine, Mode, Outcome
 from Licode.tool import DEFAULT_TIMEOUT, Registry, Result
+
+from .event import CompactEvent, CompactPhase, Event, Phase, ToolEvent, Usage
+from .runtime import SessionRuntime
 
 logger = logging.getLogger(__name__)
 
@@ -26,45 +50,6 @@ NOTICE_UNKNOWN_TOOLS = "（连续多轮只请求到未注册的工具，自动�
 NOTICE_STREAM_ERR = "（请求出错，本轮已中断。）"
 NOTICE_CANCELLED = "（已取消。）"
 EMPTY_FINAL = "（模型未生成文本答复。）"
-
-
-class Phase(IntEnum):
-    START = 0
-    END = 1
-
-
-@dataclass
-class Usage:
-    """一轮请求的 token 用量与缓存命中信息。"""
-
-    input: int = 0
-    output: int = 0
-    cache_write: int = 0
-    cache_read: int = 0
-
-
-@dataclass
-class ToolEvent:
-    """供界面渲染的一次工具开始或结束事件。"""
-
-    name: str
-    args: str = ""
-    phase: Phase = Phase.START
-    result: str = ""
-    is_error: bool = False
-
-
-@dataclass
-class Event:
-    """Agent Loop 向界面输出的统一事件。"""
-
-    text: str = ""
-    tool: ToolEvent | None = None
-    usage: Usage | None = None
-    iter: int = 0
-    notice: str = ""
-    done: bool = False
-    err: Exception | None = None
 
 
 @dataclass
@@ -85,21 +70,36 @@ class Agent:
     """循环调用模型与工具，直到任务完成或触发停止条件。"""
 
     def __init__(
-        self, provider: Provider, registry: Registry, version: str, engine: Engine
+        self,
+        provider: Provider,
+        registry: Registry,
+        version: str,
+        engine: Engine,
+        *,
+        runtime: SessionRuntime | None = None,
     ) -> None:
         self._provider = provider
         self._registry = registry
         self._version = version
         self._engine = engine
+        self.runtime = runtime or SessionRuntime(
+            replacement=ContentReplacementState(),
+            recovery=RecoveryState(),
+            auto_tracking=CompactCircuitBreaker(),
+            session=new_session_context("."),
+        )
+        self._run_lock = asyncio.Lock()
 
     async def run(
         self, conv: Conversation, mode: Mode, cancel: asyncio.Event
     ) -> AsyncIterator[AgentOutput]:
-        if mode is Mode.PLAN:
-            definitions = self._registry.read_only_definitions()
-        else:
-            definitions = self._registry.definitions()
+        async with self._run_lock:
+            async for output in self._run_locked(conv, mode, cancel):
+                yield output
 
+    async def _run_locked(
+        self, conv: Conversation, mode: Mode, cancel: asyncio.Event
+    ) -> AsyncIterator[AgentOutput]:
         environment = await asyncio.to_thread(
             prompt.gather_environment, self._version, self._provider.model
         )
@@ -112,6 +112,40 @@ class Agent:
             if cancel.is_set():
                 self._ensure_assistant_tail(conv, NOTICE_CANCELLED)
                 return
+
+            if mode is Mode.PLAN:
+                definitions = self._registry.read_only_definitions()
+            else:
+                definitions = self._registry.definitions()
+
+            manage_input = await self._manage_input(conv, definitions, TriggerKind.AUTO)
+            auto_threshold = manage_input.context_window - SUMMARY_RESERVE - AUTO_SAFETY_MARGIN
+            will_summarize = (
+                manage_input.context_window > SUMMARY_RESERVE + AUTO_SAFETY_MARGIN
+                and manage_input.estimated_token >= auto_threshold
+                and not self.runtime.auto_tracking.tripped()
+            )
+            if will_summarize:
+                yield Event(compact=CompactEvent(phase=CompactPhase.BEFORE_AUTO))
+            compact_error: Exception | None = None
+            try:
+                manage_output = await manage_context(manage_input)
+            except Exception as exc:
+                compact_error = exc
+                manage_output = ManageOutput(
+                    before_tokens=manage_input.estimated_token,
+                    after_tokens=manage_input.estimated_token,
+                )
+                logger.warning("自动压缩失败，本轮继续使用可用历史: %s", exc)
+            if will_summarize:
+                yield Event(
+                    compact=CompactEvent(
+                        phase=CompactPhase.AFTER_AUTO,
+                        before=manage_output.before_tokens,
+                        after=manage_output.after_tokens,
+                        err=compact_error,
+                    )
+                )
 
             stream_queue: asyncio.Queue[Event] = asyncio.Queue(maxsize=1)
             reminder = ""
@@ -132,13 +166,78 @@ class Agent:
             try:
                 async for event in self._drain(stream_task, stream_queue):
                     yield event
-                text, calls, usage, ok = await stream_task
+                text, calls, usage, stream_error = await stream_task
             finally:
                 await self._stop_task(stream_task)
 
-            if not ok:
+            if cancel.is_set():
+                self._ensure_assistant_tail(conv, NOTICE_CANCELLED)
+                return
+
+            emergency_retried = False
+            if isinstance(stream_error, PromptTooLongError):
+                yield Event(compact=CompactEvent(phase=CompactPhase.BEFORE_EMERGENCY))
+                emergency_input = await self._manage_input(
+                    conv,
+                    definitions,
+                    TriggerKind.EMERGENCY,
+                )
+                try:
+                    emergency_output = await manage_context(emergency_input)
+                except Exception as exc:
+                    yield Event(
+                        compact=CompactEvent(
+                            phase=CompactPhase.AFTER_EMERGENCY,
+                            before=emergency_input.estimated_token,
+                            err=exc,
+                        )
+                    )
+                    yield Event(err=exc)
+                    self._ensure_assistant_tail(conv, NOTICE_STREAM_ERR)
+                    return
+                yield Event(
+                    compact=CompactEvent(
+                        phase=CompactPhase.AFTER_EMERGENCY,
+                        before=emergency_output.before_tokens,
+                        after=emergency_output.after_tokens,
+                    )
+                )
+                async with self.runtime._lock:
+                    self.runtime.usage_anchor = 0
+                    self.runtime.anchor_msg_len = 0
+                    context_window = self.runtime.context_window
+                estimate = estimate_tokens(0, conv.messages(), 0)
+                if estimate >= context_window - MANUAL_SAFETY_MARGIN:
+                    yield Event(err=stream_error)
+                    self._ensure_assistant_tail(conv, NOTICE_STREAM_ERR)
+                    return
+                emergency_retried = True
+                retry_queue: asyncio.Queue[Event] = asyncio.Queue(maxsize=1)
+                retry_task = asyncio.create_task(
+                    self._stream_once(
+                        conv,
+                        definitions,
+                        stable_system,
+                        environment_text,
+                        reminder,
+                        cancel,
+                        retry_queue.put,
+                    )
+                )
+                try:
+                    async for event in self._drain(retry_task, retry_queue):
+                        yield event
+                    text, calls, usage, stream_error = await retry_task
+                finally:
+                    await self._stop_task(retry_task)
+
+            if stream_error is not None:
+                yield Event(err=stream_error)
                 fallback = NOTICE_CANCELLED if cancel.is_set() else NOTICE_STREAM_ERR
                 self._ensure_assistant_tail(conv, fallback)
+                return
+            if emergency_retried and cancel.is_set():
+                self._ensure_assistant_tail(conv, NOTICE_CANCELLED)
                 return
             if usage is not None:
                 yield Event(
@@ -155,10 +254,12 @@ class Agent:
                 if not text:
                     yield Event(text=final)
                 conv.add_assistant(final)
+                await self._update_usage_anchor(conv, usage)
                 yield Event(done=True)
                 return
 
             conv.add_assistant_with_tool_calls(text, calls)
+            await self._update_usage_anchor(conv, usage)
             unknown_run = unknown_run + 1 if self._all_unknown(calls) else 0
 
             tool_queue: asyncio.Queue[AgentOutput] = asyncio.Queue(maxsize=1)
@@ -175,11 +276,13 @@ class Agent:
                     results, _ = await asyncio.shield(tool_task)
                 except asyncio.CancelledError:
                     raise
+                await self._record_read_files(calls, results)
                 conv.add_tool_results(results)
                 self._ensure_assistant_tail(conv, NOTICE_CANCELLED)
                 raise
             finally:
                 await self._stop_task(tool_task)
+            await self._record_read_files(calls, results)
             conv.add_tool_results(results)
 
             if not completed:
@@ -204,7 +307,7 @@ class Agent:
         reminder: str,
         cancel: asyncio.Event,
         push: Callable[[Event], Awaitable[None]],
-    ) -> tuple[str, list[ToolCall], LLMUsage | None, bool]:
+    ) -> tuple[str, list[ToolCall], LLMUsage | None, Exception | None]:
         text_parts: list[str] = []
         calls: list[ToolCall] = []
         usage: LLMUsage | None = None
@@ -226,7 +329,7 @@ class Agent:
                 await self._stop_task(next_event)
                 await self._stop_task(cancelled)
                 await self._close_stream(stream)
-                return "", [], None, False
+                return "", [], None, None
             await self._stop_task(cancelled)
             try:
                 stream_event = next_event.result()
@@ -235,13 +338,11 @@ class Agent:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                await push(Event(err=exc))
-                return "", [], None, False
+                return "", [], None, exc
 
             if stream_event.err is not None:
-                await push(Event(err=stream_event.err))
                 await self._close_stream(stream)
-                return "", [], None, False
+                return "", [], None, stream_event.err
             if stream_event.text:
                 text_parts.append(stream_event.text)
                 await push(Event(text=stream_event.text))
@@ -252,8 +353,90 @@ class Agent:
 
         if cancel.is_set():
             await self._close_stream(stream)
-            return "", [], None, False
-        return "".join(text_parts), calls, usage, True
+            return "", [], None, None
+        return "".join(text_parts), calls, usage, None
+
+    async def _manage_input(
+        self,
+        conv: Conversation,
+        definitions: list[ToolDefinition],
+        trigger: TriggerKind,
+    ) -> ManageInput:
+        async with self.runtime._lock:
+            anchor = self.runtime.usage_anchor
+            anchor_len = self.runtime.anchor_msg_len
+            context_window = self.runtime.context_window
+        return ManageInput(
+            conv=conv,
+            provider=self._provider,
+            context_window=context_window,
+            tool_defs=definitions,
+            replacement=self.runtime.replacement,
+            recovery=self.runtime.recovery,
+            auto_tracking=self.runtime.auto_tracking,
+            session=self.runtime.session,
+            usage_anchor=anchor,
+            anchor_msg_len=anchor_len,
+            estimated_token=estimate_tokens(anchor, conv.messages(), anchor_len),
+            trigger=trigger,
+        )
+
+    async def _update_usage_anchor(
+        self,
+        conv: Conversation,
+        usage: LLMUsage | None,
+    ) -> None:
+        if usage is None:
+            return
+        async with self.runtime._lock:
+            self.runtime.usage_anchor = usage_anchor(usage)
+            self.runtime.anchor_msg_len = conv.length()
+
+    async def _record_read_files(
+        self,
+        calls: list[ToolCall],
+        results: list[ToolResult],
+    ) -> None:
+        result_by_id = {result.tool_call_id: result for result in results}
+        for call in calls:
+            result = result_by_id.get(call.id)
+            if call.name != "read_file" or result is None or result.is_error:
+                continue
+            try:
+                args = json.loads(call.input or "{}")
+            except (json.JSONDecodeError, TypeError):
+                continue
+            path_value = args.get("path") if isinstance(args, dict) else None
+            if not isinstance(path_value, str) or not path_value:
+                continue
+            try:
+                path = Path(path_value).resolve()
+                data = await asyncio.to_thread(path.read_bytes)
+            except OSError:
+                continue
+            self.runtime.recovery.record_file(
+                str(path),
+                data.decode("utf-8", errors="replace"),
+            )
+
+    async def run_force_compact(
+        self,
+        conv: Conversation,
+        tool_defs: list[ToolDefinition],
+    ) -> tuple[int, int]:
+        """在主循环空闲时无条件执行一次手动摘要。"""
+
+        async with self._run_lock:
+            manage_input = await self._manage_input(
+                conv,
+                tool_defs,
+                TriggerKind.MANUAL,
+            )
+            output = await manage_context(manage_input)
+            async with self.runtime._lock:
+                self.runtime.usage_anchor = 0
+                self.runtime.anchor_msg_len = 0
+            return output.before_tokens, output.after_tokens
 
     async def _execute_batched(
         self,
@@ -484,8 +667,15 @@ class Agent:
                 await close()
 
 
-def new_agent(provider: Provider, registry: Registry, version: str, engine: Engine) -> Agent:
-    return Agent(provider, registry, version, engine)
+def new_agent(
+    provider: Provider,
+    registry: Registry,
+    version: str,
+    engine: Engine,
+    *,
+    runtime: SessionRuntime | None = None,
+) -> Agent:
+    return Agent(provider, registry, version, engine, runtime=runtime)
 
 
 __all__ = [
@@ -499,9 +689,12 @@ __all__ = [
     "PLAN_REMINDER_INTERVAL",
     "ApprovalRequest",
     "Agent",
+    "CompactEvent",
+    "CompactPhase",
     "Event",
     "Phase",
     "ToolEvent",
     "Usage",
+    "SessionRuntime",
     "new_agent",
 ]

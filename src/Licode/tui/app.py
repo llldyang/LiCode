@@ -15,14 +15,21 @@ from textual.message import Message as TextualMessage
 from textual.timer import Timer
 from textual.widgets import OptionList, RichLog, Static, TextArea
 
-from Licode.agent import ApprovalRequest
-from Licode.config import ProviderConfig
+from Licode.agent import Agent, ApprovalRequest, SessionRuntime, new_agent
+from Licode.compact import (
+    CompactCircuitBreaker,
+    ContentReplacementState,
+    RecoveryState,
+    new_session_context,
+)
+from Licode.config import ProviderConfig, effective_context_window
 from Licode.conversation import Conversation
 from Licode.llm import Provider, new_provider
 from Licode.permission import Engine, Mode, Outcome
-from Licode.prompt import EXECUTE_DIRECTIVE, render_banner
+from Licode.prompt import render_banner
 from Licode.tool import Registry, new_default_registry
 
+from .commands import dispatch_command
 from .select import provider_at, provider_options
 from .stream import consume_stream, tick
 from .view import (
@@ -121,6 +128,7 @@ class LiCodeApp(App[None]):
         version: str,
         registry: Registry,
         engine: Engine,
+        runtime: SessionRuntime | None = None,
     ) -> None:
         super().__init__()
         self.state = SessionState.SELECTING if len(providers) > 1 else SessionState.IDLE
@@ -129,6 +137,13 @@ class LiCodeApp(App[None]):
         self.provider: Provider | None = None
         self._tool_registry = registry
         self.engine = engine
+        self.runtime = runtime or SessionRuntime(
+            replacement=ContentReplacementState(),
+            recovery=RecoveryState(),
+            auto_tracking=CompactCircuitBreaker(),
+            session=new_session_context(str(Path.cwd())),
+        )
+        self.agent: Agent | None = None
         self.conv = Conversation()
         self.mode = engine.start_mode()
         self.iter = 0
@@ -170,6 +185,14 @@ class LiCodeApp(App[None]):
 
     def _activate_provider(self, cfg: ProviderConfig) -> None:
         self.provider = new_provider(cfg)
+        self.runtime.context_window = effective_context_window(cfg)
+        self.agent = new_agent(
+            self.provider,
+            self._tool_registry,
+            self.version,
+            self.engine,
+            runtime=self.runtime,
+        )
         self.state = SessionState.IDLE
         self.query_one("#provider-select", OptionList).styles.display = "none"
         for selector in ("#log", "#streaming", "#input-hint", "#input", "#statusbar"):
@@ -187,26 +210,14 @@ class LiCodeApp(App[None]):
         if self.state is not SessionState.IDLE or not text.strip():
             return
         command = text.strip()
-        if command == "/exit":
-            await self.action_quit()
-            return
-        if command == "/plan":
+        handler, handled = dispatch_command(command)
+        if handled and handler is not None:
             self.query_one("#input", MessageInput).text = ""
-            self.mode = Mode.PLAN
-            rendered_notice = notice_block("已进入计划模式（只读工具）")
-            self.query_one("#log", RichLog).write(rendered_notice)
-            self._transcript.append(rendered_notice)
-            self._update_status_bar()
+            await handler(self)
             return
+        await self._start_turn(text, text)
 
-        history_text = text
-        rendered_text = text
-        if command == "/do":
-            self.mode = Mode.DEFAULT
-            history_text = EXECUTE_DIRECTIVE
-            rendered_text = "/do"
-            self._update_status_bar()
-
+    async def _start_turn(self, history_text: str, rendered_text: str) -> None:
         self.conv.add_user(history_text)
         rendered_user = user_block(rendered_text)
         self.query_one("#log", RichLog).write(rendered_user)
@@ -221,6 +232,11 @@ class LiCodeApp(App[None]):
         self._refresh_streaming_view()
         self._timer = self.set_interval(0.1, self._tick)
         self._stream_task = asyncio.create_task(self._consume_agent_events())
+
+    def _write_notice(self, text: str) -> None:
+        rendered_notice = notice_block(text)
+        self.query_one("#log", RichLog).write(rendered_notice)
+        self._transcript.append(rendered_notice)
 
     async def _consume_agent_events(self) -> None:
         await consume_stream(self)

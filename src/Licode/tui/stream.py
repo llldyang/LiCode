@@ -6,8 +6,9 @@ from typing import TYPE_CHECKING
 from rich.markdown import Markdown
 from textual.widgets import RichLog
 
-from Licode.agent import ApprovalRequest, Phase, new_agent
+from Licode.agent import ApprovalRequest, Phase
 
+from .commands import format_compact_notice
 from .view import error_block, notice_block, tool_line, tool_result_summary
 
 if TYPE_CHECKING:
@@ -20,10 +21,14 @@ async def consume_stream(app: "LiCodeApp") -> None:
             raise RuntimeError("尚未选择 provider")
         if app.turn_cancel is None:
             raise RuntimeError("本轮取消事件尚未初始化")
-        agent = new_agent(app.provider, app._tool_registry, app.version, app.engine)
-        async for event in agent.run(app.conv, app.mode, app.turn_cancel):
+        if app.agent is None:
+            raise RuntimeError("Agent 尚未初始化")
+        async for event in app.agent.run(app.conv, app.mode, app.turn_cancel):
             if isinstance(event, ApprovalRequest):
                 app._show_approval(event)
+                continue
+            if event.compact is not None:
+                app._write_notice(format_compact_notice(event.compact))
                 continue
             if event.err is not None:
                 rendered_error = error_block(event.err)

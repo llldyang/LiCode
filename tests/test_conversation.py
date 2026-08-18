@@ -1,5 +1,5 @@
 from Licode.conversation import Conversation
-from Licode.llm import ToolCall, ToolResult
+from Licode.llm import Message, ToolCall, ToolResult
 
 
 def test_messages_keep_order_and_roles() -> None:
@@ -53,3 +53,18 @@ def test_last_role_tracks_history_tail() -> None:
     assert conversation.last_role() == "tool"
     conversation.add_assistant("助手")
     assert conversation.last_role() == "assistant"
+
+
+def test_replace_history_deep_copies_and_accepts_empty() -> None:
+    conversation = Conversation()
+    source = [Message(role="user", content="原文")]
+    conversation.replace_history(source)
+    source[0].content = "外部修改"
+    source.clear()
+    assert conversation.messages()[0].content == "原文"
+    assert conversation.length() == 1
+
+    conversation.replace_history(None)
+    assert conversation.messages() == []
+    conversation.replace_history([])
+    assert conversation.length() == 0

@@ -14,6 +14,7 @@ from . import (
     ROLE_ASSISTANT,
     ROLE_TOOL,
     Message,
+    PromptTooLongError,
     Request,
     StreamEvent,
     ToolCall,
@@ -178,4 +179,17 @@ class AnthropicProvider:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            yield StreamEvent(err=exc)
+            if _is_prompt_too_long(exc):
+                wrapped = PromptTooLongError("anthropic prompt too long")
+                wrapped.__cause__ = exc
+                yield StreamEvent(err=wrapped)
+            else:
+                yield StreamEvent(err=exc)
+
+
+def _is_prompt_too_long(error: Exception) -> bool:
+    if not isinstance(error, anthropic.BadRequestError):
+        return False
+    body = getattr(error, "body", None)
+    text = f"{error} {body}".lower()
+    return "prompt is too long" in text or "context_length" in text

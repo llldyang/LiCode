@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from Licode.config import ConfigError, load
+from Licode.config import ConfigError, ProviderConfig, effective_context_window, load
 
 
 def write_config(tmp_path: Path, content: str) -> str:
@@ -75,3 +75,48 @@ def test_invalid_yaml(tmp_path: Path) -> None:
     path = write_config(tmp_path, "providers: [")
     with pytest.raises(ConfigError, match="YAML 格式错误"):
         load(path)
+
+
+def test_context_window_load_and_protocol_defaults(tmp_path: Path) -> None:
+    path = write_config(
+        tmp_path,
+        """providers:
+  - name: Claude
+    protocol: anthropic
+    api_key: secret
+    model: claude-test
+    context_window: 80000
+""",
+    )
+    provider = load(path).providers[0]
+    assert provider.context_window == 80000
+    assert effective_context_window(provider) == 80000
+    assert effective_context_window(ProviderConfig("Claude", "anthropic", "key", "model")) == 200000
+    assert (
+        effective_context_window(
+            ProviderConfig("OpenAI", "openai", "key", "model", context_window=0)
+        )
+        == 128000
+    )
+    unknown = ProviderConfig("Unknown", "other", "key", "model")
+    assert effective_context_window(unknown) == 200000
+
+
+def test_context_window_must_be_integer(tmp_path: Path) -> None:
+    path = write_config(
+        tmp_path,
+        """providers:
+  - name: Claude
+    protocol: anthropic
+    api_key: secret
+    model: claude-test
+    context_window: wide
+""",
+    )
+    with pytest.raises(ConfigError, match="context_window 必须是整数"):
+        load(path)
+
+
+def test_config_example_can_be_loaded() -> None:
+    config = load(".Licode/config.yaml.example")
+    assert config.providers[0].context_window == 200000

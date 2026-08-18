@@ -9,13 +9,15 @@ from rich.console import Console
 from textual.pilot import Pilot
 from textual.widgets import Static
 
+from Licode.agent import CompactEvent, CompactPhase
 from Licode.config import ProviderConfig
-from Licode.llm import Request, StreamEvent, ToolCall
+from Licode.llm import PromptTooLongError, Request, StreamEvent, ToolCall
 from Licode.permission import Engine, Mode
 from Licode.permission.rule import Rule
 from Licode.prompt import EXECUTE_DIRECTIVE
 from Licode.tool import new_default_registry
 from Licode.tui.app import LiCodeApp, SessionState
+from Licode.tui.commands import BUILTIN_COMMANDS, format_compact_notice
 
 
 class FakeProvider:
@@ -235,4 +237,101 @@ async def test_escape_cancels_approval_and_next_turn_still_works(
         await app.submit("继续对话")
         await wait_for_state(pilot, app, SessionState.IDLE)
         assert app.conv.messages()[-1].content == "取消后仍可继续"
+        assert provider.call_count == 3
+
+
+@pytest.mark.asyncio
+async def test_compact_and_unknown_commands_do_not_enter_normal_chat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    summary = "<analysis>草稿</analysis><summary>手动摘要</summary>"
+    provider = FakeProvider([[StreamEvent(text=summary), StreamEvent(done=True)]])
+    app = make_app(tmp_path, monkeypatch, provider)
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app.submit("/compact")
+        assert provider.call_count == 1
+        assert provider.scripts
+        assert all("/compact" not in message.content for message in app.conv.messages())
+        assert "已压缩，token 从" in app._transcript[-1].plain
+
+        before = app.conv.length()
+        await app.submit("/unknown")
+        assert provider.call_count == 1
+        assert app.conv.length() == before
+        assert "未知命令" in app._transcript[-1].plain
+        assert "/compact" in app._transcript[-1].plain
+        assert len(BUILTIN_COMMANDS) == 4
+
+
+def test_compact_notice_format_is_shared() -> None:
+    assert (
+        format_compact_notice(CompactEvent(phase=CompactPhase.BEFORE_AUTO)) == "正在压缩上下文..."
+    )
+    assert (
+        format_compact_notice(CompactEvent(phase=CompactPhase.BEFORE_EMERGENCY))
+        == "上下文撞墙，自动压缩中..."
+    )
+    assert (
+        format_compact_notice(
+            CompactEvent(phase=CompactPhase.AFTER_AUTO, before=167000, after=12000)
+        )
+        == "已压缩，token 从 167000 降至 12000"
+    )
+    assert "压缩失败" in format_compact_notice(
+        CompactEvent(
+            phase=CompactPhase.AFTER_EMERGENCY,
+            err=RuntimeError("失败"),
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_tui_renders_auto_compact_notices(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    summary = "<analysis>草稿</analysis><summary>自动摘要</summary>"
+    provider = FakeProvider(
+        [
+            [StreamEvent(text=summary), StreamEvent(done=True)],
+            [StreamEvent(text="完成"), StreamEvent(done=True)],
+        ]
+    )
+    app = make_app(tmp_path, monkeypatch, provider)
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.runtime.context_window = 60000
+        for _ in range(10):
+            app.conv.add_user("u" * 7000)
+            app.conv.add_assistant("a" * 7000)
+        await app.submit("继续")
+        await wait_for_state(pilot, app, SessionState.IDLE)
+        notices = [getattr(item, "plain", "") for item in app._transcript]
+        assert "正在压缩上下文..." in notices
+        assert any("已压缩，token 从" in notice for notice in notices)
+
+
+@pytest.mark.asyncio
+async def test_tui_renders_emergency_compact_notices(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    summary = "<analysis>草稿</analysis><summary>紧急摘要</summary>"
+    provider = FakeProvider(
+        [
+            [StreamEvent(err=PromptTooLongError("过长"))],
+            [StreamEvent(text=summary), StreamEvent(done=True)],
+            [StreamEvent(text="重试完成"), StreamEvent(done=True)],
+        ]
+    )
+    app = make_app(tmp_path, monkeypatch, provider)
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app.submit("触发紧急压缩")
+        await wait_for_state(pilot, app, SessionState.IDLE)
+        notices = [getattr(item, "plain", "") for item in app._transcript]
+        assert "上下文撞墙，自动压缩中..." in notices
+        assert any("已压缩，token 从" in notice for notice in notices)
         assert provider.call_count == 3

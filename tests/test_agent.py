@@ -18,10 +18,26 @@ from Licode.agent import (
     PLAN_REMINDER_INTERVAL,
     Agent,
     ApprovalRequest,
+    CompactPhase,
     Phase,
+    SessionRuntime,
+)
+from Licode.compact import (
+    CompactCircuitBreaker,
+    ContentReplacementState,
+    RecoveryState,
+    new_session_context,
 )
 from Licode.conversation import Conversation
-from Licode.llm import Message, Request, StreamEvent, ToolCall, ToolDefinition, Usage
+from Licode.llm import (
+    Message,
+    PromptTooLongError,
+    Request,
+    StreamEvent,
+    ToolCall,
+    ToolDefinition,
+    Usage,
+)
 from Licode.permission import Decision, Engine, Mode, Outcome, new_engine
 from Licode.tool import Registry, Result, new_default_registry
 
@@ -90,6 +106,24 @@ def permission_engine(root: Path | None = None) -> Engine:
     return Engine(
         root=str(base),
         local_path=str(base / ".Licode" / "settings.local.yaml"),
+    )
+
+
+def session_runtime(tmp_path: Path, context_window: int = 200000) -> SessionRuntime:
+    return SessionRuntime(
+        replacement=ContentReplacementState(),
+        recovery=RecoveryState(),
+        auto_tracking=CompactCircuitBreaker(),
+        session=new_session_context(str(tmp_path)),
+        context_window=context_window,
+    )
+
+
+def compact_summary() -> str:
+    return (
+        "<analysis>草稿</analysis><summary>"
+        + "\n".join(f"## {index} 小节" for index in range(1, 10))
+        + "</summary>"
     )
 
 
@@ -591,3 +625,273 @@ async def test_cancelling_task_while_waiting_for_approval_cleans_up(
         if pending is not asyncio.current_task() and not pending.done()
     }
     assert remaining <= baseline
+
+
+@pytest.mark.asyncio
+async def test_agent_emits_auto_compact_events(tmp_path: Path) -> None:
+    provider = FakeProvider(
+        [
+            [
+                StreamEvent(text=compact_summary()),
+                StreamEvent(usage=Usage(900, 99)),
+                StreamEvent(done=True),
+            ],
+            [
+                StreamEvent(text="压缩后继续"),
+                StreamEvent(usage=Usage(100, 10)),
+                StreamEvent(done=True),
+            ],
+        ]
+    )
+    conversation = Conversation()
+    for _ in range(10):
+        conversation.add_user("u" * 7000)
+        conversation.add_assistant("a" * 7000)
+    runtime = session_runtime(tmp_path, context_window=60000)
+
+    events = [
+        event
+        async for event in Agent(
+            provider,
+            new_default_registry(),
+            "test",
+            permission_engine(tmp_path),
+            runtime=runtime,
+        ).run(conversation, Mode.DEFAULT, asyncio.Event())
+    ]
+
+    compact_events = [event.compact for event in events if event.compact is not None]
+    assert [event.phase for event in compact_events] == [
+        CompactPhase.BEFORE_AUTO,
+        CompactPhase.AFTER_AUTO,
+    ]
+    assert compact_events[1].before > compact_events[1].after
+    assert provider.requests[0].tools is None
+    assert provider.requests[1].tools is provider.tool_definitions[1]
+    recovery_text = provider.requests[1].messages[0].content
+    assert "## 当前可用工具" in recovery_text
+    for definition in provider.requests[1].tools or []:
+        assert f"- {definition.name}:" in recovery_text
+        schema = json.dumps(
+            definition.input_schema,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        assert f"input_schema: {schema}" in recovery_text
+    assert runtime.usage_anchor == 110
+
+
+@pytest.mark.asyncio
+async def test_agent_has_no_compact_event_below_threshold(tmp_path: Path) -> None:
+    provider = FakeProvider([[StreamEvent(text="完成"), StreamEvent(done=True)]])
+    conversation = Conversation()
+    conversation.add_user("短请求")
+    runtime = session_runtime(tmp_path)
+    events = [
+        event
+        async for event in Agent(
+            provider,
+            Registry(),
+            "test",
+            permission_engine(tmp_path),
+            runtime=runtime,
+        ).run(conversation, Mode.DEFAULT, asyncio.Event())
+    ]
+    assert not any(event.compact is not None for event in events)
+
+
+@pytest.mark.asyncio
+async def test_agent_emergency_compact_retries_once(tmp_path: Path) -> None:
+    ptl = PromptTooLongError("主请求过长")
+    provider = FakeProvider(
+        [
+            [StreamEvent(err=ptl)],
+            [StreamEvent(text=compact_summary()), StreamEvent(done=True)],
+            [StreamEvent(text="重试成功"), StreamEvent(usage=Usage(50, 5)), StreamEvent(done=True)],
+        ]
+    )
+    conversation = Conversation()
+    conversation.add_user("继续任务")
+    runtime = session_runtime(tmp_path)
+    events = [
+        event
+        async for event in Agent(
+            provider,
+            Registry(),
+            "test",
+            permission_engine(tmp_path),
+            runtime=runtime,
+        ).run(conversation, Mode.DEFAULT, asyncio.Event())
+    ]
+
+    compact_events = [event.compact for event in events if event.compact is not None]
+    assert [event.phase for event in compact_events] == [
+        CompactPhase.BEFORE_EMERGENCY,
+        CompactPhase.AFTER_EMERGENCY,
+    ]
+    assert provider.call_count == 3
+    assert events[-1].done
+    assert conversation.messages()[-1].content == "重试成功"
+
+
+@pytest.mark.asyncio
+async def test_agent_second_prompt_too_long_is_not_retried(tmp_path: Path) -> None:
+    ptl = PromptTooLongError("主请求过长")
+    provider = FakeProvider(
+        [
+            [StreamEvent(err=ptl)],
+            [StreamEvent(text=compact_summary()), StreamEvent(done=True)],
+            [StreamEvent(err=ptl)],
+        ]
+    )
+    conversation = Conversation()
+    conversation.add_user("继续任务")
+    events = [
+        event
+        async for event in Agent(
+            provider,
+            Registry(),
+            "test",
+            permission_engine(tmp_path),
+            runtime=session_runtime(tmp_path),
+        ).run(conversation, Mode.DEFAULT, asyncio.Event())
+    ]
+    assert provider.call_count == 3
+    assert any(event.err is ptl for event in events)
+    assert not events[-1].done
+
+
+@pytest.mark.asyncio
+async def test_agent_records_clean_read_file_snapshot(tmp_path: Path) -> None:
+    target = tmp_path / "raw.txt"
+    target.write_text("第一行\n第二行", encoding="utf-8")
+    call = ToolCall("read", "read_file", json.dumps({"path": str(target)}))
+    provider = FakeProvider(
+        [
+            [StreamEvent(tool_calls=[call]), StreamEvent(done=True)],
+            [StreamEvent(text="完成"), StreamEvent(done=True)],
+        ]
+    )
+    runtime = session_runtime(tmp_path)
+    conversation = Conversation()
+    conversation.add_user("读取")
+    _ = [
+        event
+        async for event in Agent(
+            provider,
+            new_default_registry(),
+            "test",
+            permission_engine(tmp_path),
+            runtime=runtime,
+        ).run(conversation, Mode.DEFAULT, asyncio.Event())
+    ]
+    record = runtime.recovery.snapshot()[0]
+    assert record.path == str(target.resolve())
+    assert record.content == target.read_bytes().decode("utf-8")
+    assert "\t" not in record.content
+
+
+@pytest.mark.asyncio
+async def test_run_force_compact_waits_for_active_run(tmp_path: Path) -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class BlockingProvider:
+        @property
+        def name(self) -> str:
+            return "blocking"
+
+        @property
+        def model(self) -> str:
+            return "blocking"
+
+        async def stream(self, request: Request) -> AsyncIterator[StreamEvent]:
+            if request.tools is None:
+                yield StreamEvent(text=compact_summary())
+                return
+            started.set()
+            await release.wait()
+            yield StreamEvent(text="完成")
+            yield StreamEvent(done=True)
+
+    conversation = Conversation()
+    conversation.add_user("运行")
+    agent = Agent(
+        BlockingProvider(),
+        Registry(),
+        "test",
+        permission_engine(tmp_path),
+        runtime=session_runtime(tmp_path),
+    )
+
+    async def collect() -> None:
+        _ = [event async for event in agent.run(conversation, Mode.DEFAULT, asyncio.Event())]
+
+    run_task = asyncio.create_task(collect())
+    await asyncio.wait_for(started.wait(), timeout=1)
+    compact_task = asyncio.create_task(agent.run_force_compact(conversation, []))
+    await asyncio.sleep(0)
+    assert not compact_task.done()
+    release.set()
+    await asyncio.wait_for(run_task, timeout=1)
+    before, after = await asyncio.wait_for(compact_task, timeout=1)
+    assert before >= 0
+    assert after >= 0
+
+
+@pytest.mark.asyncio
+async def test_usage_anchor_is_replaced_across_runs(tmp_path: Path) -> None:
+    provider = FakeProvider(
+        [
+            [StreamEvent(text="一"), StreamEvent(usage=Usage(900, 100))],
+            [StreamEvent(text="二"), StreamEvent(usage=Usage(1200, 200, cache_read=100))],
+            [StreamEvent(text="三"), StreamEvent(usage=Usage(1800, 200, cache_write=200))],
+        ]
+    )
+    runtime = session_runtime(tmp_path)
+    agent = Agent(
+        provider,
+        Registry(),
+        "test",
+        permission_engine(tmp_path),
+        runtime=runtime,
+    )
+    conversation = Conversation()
+    observed: list[int] = []
+    for text in ("第一轮", "第二轮", "第三轮"):
+        conversation.add_user(text)
+        _ = [event async for event in agent.run(conversation, Mode.DEFAULT, asyncio.Event())]
+        observed.append(runtime.usage_anchor)
+    assert observed == [1000, 1500, 2200]
+
+
+@pytest.mark.asyncio
+async def test_agent_reuses_same_tool_definition_reference(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import Licode.agent as agent_module
+
+    original = agent_module.manage_context
+    definition_ids: list[int] = []
+
+    async def capture(manage_input):
+        definition_ids.append(id(manage_input.tool_defs))
+        return await original(manage_input)
+
+    monkeypatch.setattr(agent_module, "manage_context", capture)
+    provider = FakeProvider([[StreamEvent(text="完成"), StreamEvent(done=True)]])
+    conversation = Conversation()
+    conversation.add_user("检查工具定义")
+    _ = [
+        event
+        async for event in Agent(
+            provider,
+            new_default_registry(),
+            "test",
+            permission_engine(tmp_path),
+            runtime=session_runtime(tmp_path),
+        ).run(conversation, Mode.DEFAULT, asyncio.Event())
+    ]
+    assert definition_ids == [id(provider.requests[0].tools)]

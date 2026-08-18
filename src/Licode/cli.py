@@ -6,6 +6,13 @@ import sys
 
 from Licode import __version__, config, permission
 from Licode import mcp as mcp_client
+from Licode.agent import SessionRuntime
+from Licode.compact import (
+    CompactCircuitBreaker,
+    ContentReplacementState,
+    RecoveryState,
+    new_session_context,
+)
 from Licode.config import ConfigError
 from Licode.tool import new_default_registry
 from Licode.tui import new_app
@@ -20,6 +27,12 @@ async def _amain() -> int:
 
     try:
         root = os.getcwd()
+        runtime = SessionRuntime(
+            replacement=ContentReplacementState(),
+            recovery=RecoveryState(),
+            auto_tracking=CompactCircuitBreaker(),
+            session=new_session_context(root),
+        )
         registry = new_default_registry()
         mcp_config = mcp_client.load_config(root)
         manager = await mcp_client.new_manager(mcp_config, version=__version__)
@@ -29,7 +42,7 @@ async def _amain() -> int:
             engine, engine_error = permission.new_engine(root)
             if engine_error is not None:
                 print(f"权限引擎降级: {engine_error}", file=sys.stderr)
-            app = new_app(cfg.providers, __version__, registry, engine)
+            app = new_app(cfg.providers, __version__, registry, engine, runtime)
             await app.run_async(inline=True, inline_no_clear=True)
             app.print_transcript()
         finally:
