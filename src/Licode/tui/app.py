@@ -18,6 +18,7 @@ from textual.widgets import OptionList, RichLog, Static, TextArea
 
 from Licode.agent import (
     Agent,
+    AgentTool,
     ApprovalRequest,
     CompactEvent,
     CompactPhase,
@@ -51,6 +52,8 @@ from Licode.prompt import render_banner
 from Licode.session import SessionInfo, Writer
 from Licode.skills import Catalog, SkillSummary
 from Licode.skills.executor import Executor
+from Licode.subagent import Catalog as SubagentCatalog
+from Licode.task import Manager as TaskManager
 from Licode.tool import Registry as ToolRegistry
 from Licode.tool import new_default_registry
 from Licode.tool.install_skill import InstallSkillTool
@@ -60,6 +63,7 @@ from .complete import CompletionMenu, handle_completion_key
 from .resume import begin_resume, do_resume_session, handle_resume_key, options_for
 from .select import provider_at, provider_options
 from .stream import consume_stream, tick
+from .tasks import consume_subagent_approvals, consume_task_done
 from .view import (
     approval_block,
     assistant_block,
@@ -187,6 +191,9 @@ class LiCodeApp(App[None]):
         catalog: Catalog | None = None,
         install_skill_tool: InstallSkillTool | None = None,
         hook_engine: HookEngine | None = None,
+        task_mgr: TaskManager | None = None,
+        subagent_catalog: SubagentCatalog | None = None,
+        agent_tool: AgentTool | None = None,
     ) -> None:
         super().__init__()
         self.state = SessionState.SELECTING if len(providers) > 1 else SessionState.IDLE
@@ -207,6 +214,13 @@ class LiCodeApp(App[None]):
             session=new_session_context(str(Path.cwd())),
         )
         self.hook_engine = hook_engine
+        self.task_mgr = task_mgr or TaskManager()
+        self.subagent_catalog = subagent_catalog or SubagentCatalog()
+        self.agent_tool = agent_tool
+        self.foreground_sub_agent = None
+        self._task_done_consumer: asyncio.Task[None] | None = None
+        self._approval_consumer: asyncio.Task[None] | None = None
+        self._approval_return_state = self.state
         self.runtime.hook_engine = hook_engine
         self._session_end_dispatched = False
         self.writer = writer
@@ -270,6 +284,8 @@ class LiCodeApp(App[None]):
             self._activate_provider(self.providers[0])
         else:
             self._show_provider_selection()
+        self._task_done_consumer = asyncio.create_task(consume_task_done(self))
+        self._approval_consumer = asyncio.create_task(consume_subagent_approvals(self))
         await self._dispatch_session_start()
 
     def _show_provider_selection(self) -> None:
@@ -304,6 +320,8 @@ class LiCodeApp(App[None]):
             memory_text=self.memory_text,
             hook_engine=self.hook_engine,
         ).with_catalog(self.catalog)
+        if self.agent_tool is not None:
+            self.agent_tool.set_parent(self.agent)
         self.skill_executor.bind(self.provider, self.conv)
         self.state = SessionState.IDLE
         self.query_one("#provider-select", OptionList).styles.display = "none"
@@ -704,7 +722,14 @@ class LiCodeApp(App[None]):
             except asyncio.CancelledError:
                 pass
         await self.dispatch_session_end()
+        for consumer in (self._task_done_consumer, self._approval_consumer):
+            if consumer is not None:
+                consumer.cancel()
         self.exit()
+
+    @property
+    def main_agent(self) -> Agent | None:
+        return self.agent
 
     def action_cancel_turn(self) -> None:
         if self.state is SessionState.RESUMING:
@@ -757,6 +782,7 @@ class LiCodeApp(App[None]):
         self._refresh_streaming_view()
 
     def _show_approval(self, request: ApprovalRequest) -> None:
+        self._approval_return_state = self.state
         self.pending = request
         self.approve_cursor = 0
         self.state = SessionState.APPROVING
@@ -767,7 +793,7 @@ class LiCodeApp(App[None]):
     def _resolve_approval(self, outcome: Outcome) -> None:
         request = self.pending
         self.pending = None
-        self.state = SessionState.STREAMING
+        self.state = self._approval_return_state
         self.query_one("#input", MessageInput).disabled = False
         if request is not None and not request.respond.done():
             request.respond.set_result(outcome)

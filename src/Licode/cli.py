@@ -7,9 +7,20 @@ from contextlib import suppress
 from datetime import timedelta
 from pathlib import Path
 
-from Licode import __version__, config, hook, instructions, memory, permission, session, skills
+from Licode import (
+    __version__,
+    config,
+    hook,
+    instructions,
+    memory,
+    permission,
+    session,
+    skills,
+    subagent,
+    task,
+)
 from Licode import mcp as mcp_client
-from Licode.agent import SessionRuntime
+from Licode.agent import AgentTool, SessionRuntime
 from Licode.compact import (
     CompactCircuitBreaker,
     ContentReplacementState,
@@ -83,6 +94,22 @@ async def _amain() -> int:
         if engine_error is not None:
             print(f"权限引擎降级: {engine_error}", file=sys.stderr)
         hook_engine = hook.load(root)
+        subagent_catalog = subagent.load_catalog(root)
+        task_mgr = task.Manager()
+        for task_tool in (
+            task.TaskListTool(task_mgr),
+            task.TaskGetTool(task_mgr),
+            task.TaskStopTool(task_mgr),
+            task.SendMessageTool(task_mgr),
+        ):
+            registry.register(task_tool)
+        agent_tool = AgentTool(
+            subagent_catalog,
+            task_mgr,
+            parent=None,
+            bg_enabled=cfg.effective_enable_subagent_background(),
+        )
+        registry.register(agent_tool)
         app = new_app(
             cfg.providers,
             __version__,
@@ -97,6 +124,9 @@ async def _amain() -> int:
             catalog,
             install_skill_tool,
             hook_engine,
+            task_mgr,
+            subagent_catalog,
+            agent_tool,
         )
         await app.run_async(inline=True, inline_no_clear=True)
         app.print_transcript()

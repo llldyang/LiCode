@@ -1,12 +1,15 @@
 """LiCode 终端界面。"""
 
 from Licode.agent import SessionRuntime
+from Licode.agent.agent_tool import AgentTool
 from Licode.config import ProviderConfig
 from Licode.hook import Engine as HookEngine
 from Licode.memory import Manager as MemoryManager
 from Licode.permission import Engine
 from Licode.session import Writer
 from Licode.skills import Catalog
+from Licode.subagent import Catalog as SubagentCatalog
+from Licode.task import Manager as TaskManager
 from Licode.tool import Registry
 from Licode.tool.install_skill import InstallSkillTool
 
@@ -27,6 +30,9 @@ def new_app(
     catalog: Catalog | None = None,
     install_skill_tool: InstallSkillTool | None = None,
     hook_engine: HookEngine | None = None,
+    task_mgr: TaskManager | None = None,
+    subagent_catalog: SubagentCatalog | None = None,
+    agent_tool: AgentTool | None = None,
 ) -> LiCodeApp:
     return LiCodeApp(
         providers,
@@ -42,6 +48,9 @@ def new_app(
         catalog,
         install_skill_tool,
         hook_engine,
+        task_mgr,
+        subagent_catalog,
+        agent_tool,
     )
 
 

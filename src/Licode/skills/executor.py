@@ -3,20 +3,12 @@
 from __future__ import annotations
 
 import asyncio
-import tempfile
-from pathlib import Path
 from typing import TYPE_CHECKING
 
-from Licode.compact import (
-    CompactCircuitBreaker,
-    ContentReplacementState,
-    RecoveryState,
-    SessionContext,
-)
 from Licode.config import ProviderConfig, effective_context_window
 from Licode.conversation import Conversation
 from Licode.llm import ROLE_ASSISTANT, ROLE_USER, Message, Provider, new_provider
-from Licode.permission import Engine, Mode
+from Licode.permission import Engine
 from Licode.tool import Registry
 
 from .active import ActiveSkills
@@ -155,41 +147,24 @@ class Executor:
         provider: Provider,
         context_window: int,
     ) -> str:
-        from Licode.agent import Event, SessionRuntime, new_agent
+        from Licode.agent.launch import ForkLaunchOpts, launch_fork
 
-        with tempfile.TemporaryDirectory(prefix="Licode-skill-fork-") as temp_dir:
-            session_dir = Path(temp_dir)
-            spill_dir = session_dir / "tool-results"
-            spill_dir.mkdir()
-            runtime = SessionRuntime(
-                replacement=ContentReplacementState(),
-                recovery=RecoveryState(),
-                auto_tracking=CompactCircuitBreaker(),
-                session=SessionContext(
-                    session_id=f"fork-{skill.name}",
-                    session_dir=str(session_dir),
-                    spill_dir=str(spill_dir),
-                ),
-                context_window=context_window,
+        del skill, context_window
+        return await launch_fork(
+            ForkLaunchOpts(
+                allowed_tools=[name for name, _ in registry.items()],
+                model=provider.model,
+                conv=conversation,
+                system_prompt="",
+                background=False,
+                events_sink=None,
+                provider=provider,
+                registry=registry,
+                engine=self.engine,
+                version=self.version,
+                hook_engine=None,
             )
-            agent = new_agent(
-                provider,
-                registry,
-                self.version,
-                self.engine,
-                runtime=runtime,
-                instruction_text=self.instruction_text,
-                memory_text=self.memory_text,
-            ).with_catalog(self.catalog)
-            result_parts: list[str] = []
-            cancel = asyncio.Event()
-            async for event in agent.run(conversation, Mode.DEFAULT, cancel):
-                if isinstance(event, Event):
-                    if event.text:
-                        result_parts.append(event.text)
-                    if event.err is not None:
-                        result_parts.append(f"[error: {event.err}]")
-            return "".join(result_parts) or "（Skill 未生成文本答复。）"
+        )
 
 
 SkillExecutor = Executor

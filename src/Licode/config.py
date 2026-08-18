@@ -30,6 +30,14 @@ class ProviderConfig:
 @dataclass
 class Config:
     providers: list[ProviderConfig] = field(default_factory=list)
+    enable_subagent_background: bool | None = None
+
+    def effective_enable_subagent_background(self) -> bool:
+        """后台 SubAgent 默认启用；显式 false 时 Fork 也不可用。"""
+
+        if self.enable_subagent_background is None:
+            return True
+        return self.enable_subagent_background
 
 
 def _required_text(item: dict[str, Any], field_name: str, index: int) -> str:
@@ -80,7 +88,13 @@ def _from_dict(raw: Any) -> Config:
                 context_window=context_window,
             )
         )
-    return Config(providers=result)
+    background = raw.get(
+        "enable_subagent_background",
+        raw.get("enableSubAgentBackground"),
+    )
+    if background is not None and not isinstance(background, bool):
+        raise ConfigError("enable_subagent_background 必须是布尔值")
+    return Config(providers=result, enable_subagent_background=background)
 
 
 def load(path: str) -> Config:

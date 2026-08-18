@@ -54,6 +54,9 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from Licode.skills import Catalog
 
+    from .agent_tool import AgentTool
+    from .permission_upgrade import ApprovalUpgrader
+
 MAX_ITERATIONS: int = 25
 MAX_UNKNOWN_RUN: int = 3
 PLAN_REMINDER_INTERVAL: int = 4
@@ -94,6 +97,13 @@ class Agent:
         instruction_text: str = "",
         memory_text: str = "",
         hook_engine: HookEngine | None = None,
+        system_prompt: str | None = None,
+        max_turns: int = 0,
+        permission_mode: Mode | None = None,
+        dont_ask: bool = False,
+        approval_upgrader: ApprovalUpgrader | None = None,
+        allowed_tools: list[str] | None = None,
+        is_sub_agent: bool = False,
     ) -> None:
         self._provider = provider
         self._registry = registry
@@ -111,7 +121,39 @@ class Agent:
         self._catalog: Catalog | None = None
         self._hook_engine = hook_engine or self.runtime.hook_engine
         self.runtime.hook_engine = self._hook_engine
+        self.system_prompt = system_prompt
+        self.max_turns = max_turns
+        self.permission_mode = permission_mode
+        self.dont_ask = dont_ask
+        self.approval_upgrader = approval_upgrader
+        self.allowed_tools = list(allowed_tools) if allowed_tools is not None else None
+        self.is_sub_agent = is_sub_agent
+        self._current_conversation: Conversation | None = None
         self._run_lock = asyncio.Lock()
+
+    @property
+    def provider(self) -> Provider:
+        return self._provider
+
+    @property
+    def registry(self) -> Registry:
+        return self._registry
+
+    @property
+    def version(self) -> str:
+        return self._version
+
+    @property
+    def engine(self) -> Engine:
+        return self._engine
+
+    @property
+    def hook_engine(self) -> HookEngine | None:
+        return self._hook_engine
+
+    @property
+    def current_conversation(self) -> Conversation | None:
+        return self._current_conversation
 
     def with_catalog(self, catalog: Catalog) -> Agent:
         self._catalog = catalog
@@ -164,12 +206,27 @@ class Agent:
         self, conv: Conversation, mode: Mode, cancel: asyncio.Event
     ) -> AsyncIterator[AgentOutput]:
         active_token = bind_active_skills(self.runtime.active_skills)
+        previous_conversation = self._current_conversation
+        self._current_conversation = conv
         try:
             async with self._run_lock:
                 async for output in self._run_locked(conv, mode, cancel):
                     yield output
         finally:
+            self._current_conversation = previous_conversation
             reset_active_skills(active_token)
+
+    async def run_to_completion(
+        self,
+        conv: Conversation,
+        task: str,
+        events: asyncio.Queue[AgentOutput | None] | None = None,
+    ) -> str:
+        """运行非交互子 Agent，直到得到最终文本或触达轮数上限。"""
+
+        from .run_to_completion import run_to_completion
+
+        return await run_to_completion(self, conv, task, events)
 
     async def _run_locked(
         self, conv: Conversation, mode: Mode, cancel: asyncio.Event
@@ -187,7 +244,7 @@ class Agent:
             if self._catalog is not None
             else ""
         )
-        stable_system = prompt.build_system_prompt(
+        stable_system = self.system_prompt or prompt.build_system_prompt(
             self._instruction_text,
             memory_text,
             skills_catalog,
@@ -195,16 +252,21 @@ class Agent:
         base_environment = environment.render()
 
         unknown_run = 0
-        for iteration in range(1, MAX_ITERATIONS + 1):
+        turns = self.max_turns or MAX_ITERATIONS
+        effective_mode = self.permission_mode or mode
+        for iteration in range(1, turns + 1):
             yield Event(iter=iteration)
             if cancel.is_set():
                 self._ensure_assistant_tail(conv, NOTICE_CANCELLED)
                 return
 
-            if mode is Mode.PLAN:
+            if effective_mode is Mode.PLAN:
                 definitions = self._registry.read_only_definitions()
             else:
                 definitions = self._registry.definitions()
+            if self.allowed_tools is not None:
+                allowed_names = set(self.allowed_tools)
+                definitions = [item for item in definitions if item.name in allowed_names]
 
             active_block = prompt.render_active_skills_block(
                 to_prompt_entries(self.runtime.active_skills)
@@ -412,7 +474,7 @@ class Agent:
 
             tool_queue: asyncio.Queue[AgentOutput] = asyncio.Queue(maxsize=1)
             tool_task = asyncio.create_task(
-                self._execute_batched(calls, mode, cancel, tool_queue.put)
+                self._execute_batched(calls, effective_mode, cancel, tool_queue.put)
             )
             try:
                 async for output in self._drain(tool_task, tool_queue):
@@ -445,7 +507,7 @@ class Agent:
 
         yield Event(notice=NOTICE_MAX_ITER)
         self._ensure_assistant_tail(conv, NOTICE_MAX_ITER)
-        await self._dispatch_hook(HookEvent.STOP, mode, iter=MAX_ITERATIONS)
+        await self._dispatch_hook(HookEvent.STOP, effective_mode, iter=turns)
         yield Event(done=True)
 
     async def _stream_once(
@@ -705,27 +767,42 @@ class Agent:
                 elif decision is Decision.ALLOW:
                     result, completed = await self._run_one(call, cancel)
                 else:
-                    await self._dispatch_hook(
-                        HookEvent.NOTIFICATION,
-                        mode,
-                        kind="approval",
-                        detail=call.name,
-                    )
-                    try:
-                        outcome = await self._request_approval(call, reason, cancel, push)
-                    except asyncio.CancelledError:
-                        result = Result(NOTICE_CANCELLED, is_error=True)
-                        completed = False
+                    if self.dont_ask:
+                        result, completed = await self._run_one(call, cancel)
                     else:
-                        if outcome is Outcome.DENY_ONCE:
-                            result = Result("用户拒绝本次工具调用", is_error=True)
+                        await self._dispatch_hook(
+                            HookEvent.NOTIFICATION,
+                            mode,
+                            kind="approval",
+                            detail=call.name,
+                        )
+                        upgraded = False
+                        outcome = Outcome.DENY_ONCE
+                        if self.approval_upgrader is not None:
+                            respond = asyncio.get_running_loop().create_future()
+                            request = ApprovalRequest(
+                                name=call.name,
+                                args=self._preview(call.input),
+                                reason=reason,
+                                respond=respond,
+                            )
+                            outcome, upgraded = await self.approval_upgrader(request)
+                        try:
+                            if not upgraded:
+                                outcome = await self._request_approval(call, reason, cancel, push)
+                        except asyncio.CancelledError:
+                            result = Result(NOTICE_CANCELLED, is_error=True)
+                            completed = False
                         else:
-                            if outcome is Outcome.ALLOW_FOREVER:
-                                try:
-                                    self._engine.persist_local_allow(call)
-                                except Exception as exc:
-                                    logger.warning("永久权限规则写入失败: %s", exc)
-                            result, completed = await self._run_one(call, cancel)
+                            if outcome is Outcome.DENY_ONCE:
+                                result = Result("用户拒绝本次工具调用", is_error=True)
+                            else:
+                                if outcome is Outcome.ALLOW_FOREVER:
+                                    try:
+                                        self._engine.persist_local_allow(call)
+                                    except Exception as exc:
+                                        logger.warning("永久权限规则写入失败: %s", exc)
+                                result, completed = await self._run_one(call, cancel)
                 tool_result = self._tool_result(call, result)
             results[index] = tool_result
             await self._dispatch_hook(
@@ -775,12 +852,16 @@ class Agent:
     async def _run_one(self, call: ToolCall, cancel: asyncio.Event) -> tuple[Result, bool]:
         if cancel.is_set():
             return Result(NOTICE_CANCELLED, is_error=True), False
-        execution = asyncio.create_task(
-            asyncio.wait_for(
-                self._registry.execute(call.name, call.input, DEFAULT_TIMEOUT),
-                timeout=DEFAULT_TIMEOUT,
-            )
-        )
+        from .context import reset_execution_context, set_execution_context
+
+        async def execute() -> Result:
+            tokens = set_execution_context(self, self._current_conversation)
+            try:
+                return await self._registry.execute(call.name, call.input, DEFAULT_TIMEOUT)
+            finally:
+                reset_execution_context(tokens)
+
+        execution = asyncio.create_task(asyncio.wait_for(execute(), timeout=DEFAULT_TIMEOUT))
         cancelled = asyncio.create_task(cancel.wait())
         done, _ = await asyncio.wait({execution, cancelled}, return_when=asyncio.FIRST_COMPLETED)
         if execution in done:
@@ -923,6 +1004,13 @@ def new_agent(
     instruction_text: str = "",
     memory_text: str = "",
     hook_engine: HookEngine | None = None,
+    system_prompt: str | None = None,
+    max_turns: int = 0,
+    permission_mode: Mode | None = None,
+    dont_ask: bool = False,
+    approval_upgrader: ApprovalUpgrader | None = None,
+    allowed_tools: list[str] | None = None,
+    is_sub_agent: bool = False,
 ) -> Agent:
     return Agent(
         provider,
@@ -934,6 +1022,13 @@ def new_agent(
         instruction_text=instruction_text,
         memory_text=memory_text,
         hook_engine=hook_engine,
+        system_prompt=system_prompt,
+        max_turns=max_turns,
+        permission_mode=permission_mode,
+        dont_ask=dont_ask,
+        approval_upgrader=approval_upgrader,
+        allowed_tools=allowed_tools,
+        is_sub_agent=is_sub_agent,
     )
 
 
@@ -948,6 +1043,8 @@ __all__ = [
     "PLAN_REMINDER_INTERVAL",
     "ApprovalRequest",
     "Agent",
+    "AgentTool",
+    "MaxTurnsReached",
     "CompactEvent",
     "CompactPhase",
     "Event",
@@ -957,3 +1054,14 @@ __all__ = [
     "SessionRuntime",
     "new_agent",
 ]
+
+
+from .run_to_completion import MaxTurnsReached  # noqa: E402
+
+
+def __getattr__(name: str) -> object:
+    if name == "AgentTool":
+        from .agent_tool import AgentTool
+
+        return AgentTool
+    raise AttributeError(name)
