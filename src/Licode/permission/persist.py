@@ -7,6 +7,7 @@ import yaml
 
 from Licode.llm import ToolCall
 
+from .matcher import compile_matcher
 from .rule import Rule, RuleSet, escape_glob
 from .sandbox import project_relative
 from .settings import extract_target, friendly_name, load_settings
@@ -23,17 +24,22 @@ def rule_for(engine: PersistableEngine, call: ToolCall) -> tuple[Rule, str, bool
     friendly = friendly_name(call.name)
     if not ok:
         if not call.name or friendly != call.name:
-            return Rule("", "", False), "", False
-        rule = Rule(friendly, "", True)
+            return Rule("", None, False), "", False
+        rule = Rule(friendly, None, True, friendly)
         return rule, rule.render(), True
     if not target:
-        return Rule("", "", False), "", False
+        return Rule("", None, False), "", False
     try:
         exact_target = project_relative(engine.root, target) if is_file else target
     except (OSError, ValueError):
-        return Rule("", "", False), "", False
+        return Rule("", None, False), "", False
     exact_pattern = escape_glob(exact_target)
-    rule = Rule(friendly, exact_pattern, True)
+    rule = Rule(
+        friendly,
+        compile_matcher(exact_pattern, is_command=(friendly == "Bash")),
+        True,
+        exact_pattern,
+    )
     return rule, rule.render(), True
 
 

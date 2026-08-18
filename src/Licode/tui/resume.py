@@ -76,7 +76,6 @@ async def do_resume_session(app: LiCodeApp, info: SessionInfo) -> None:
     messages = load_session(info.dir)
     last_timestamp = load_session_timestamp(info.dir)
     new_writer: Writer | None = None
-    old_session = app.runtime.session
     try:
         new_context = open_session_context(app.workspace, info.id)
         new_writer = Writer.open_existing(info.dir)
@@ -86,18 +85,6 @@ async def do_resume_session(app: LiCodeApp, info: SessionInfo) -> None:
             new_writer.on_append,
             new_writer.on_replace,
         )
-        app.runtime.session = new_context
-        threshold = app.runtime.context_window - SUMMARY_RESERVE - AUTO_SAFETY_MARGIN
-        if estimate_tokens(0, messages, 0) > threshold:
-            definitions = (
-                app._tool_registry.read_only_definitions()
-                if app.mode() is Mode.PLAN
-                else app._tool_registry.definitions()
-            )
-            try:
-                await app.agent.run_force_compact(conversation, definitions)
-            except Exception as exc:
-                app._write_notice(f"恢复会话时压缩失败，继续加载原历史：{exc}")
         if last_timestamp and time.time() - last_timestamp > 6 * 60 * 60:
             duration = _duration_text(int(time.time() - last_timestamp))
             conversation.add_user(
@@ -105,21 +92,34 @@ async def do_resume_session(app: LiCodeApp, info: SessionInfo) -> None:
                 "部分上下文可能已过时，如需最新信息请重新读取相关文件。"
             )
     except Exception as exc:
-        app.runtime.session = old_session
         if new_writer is not None:
             new_writer.close()
         app._cancel_resume()
         app._write_notice(f"恢复会话失败：{exc}")
         return
 
+    await app.dispatch_session_end()
     old_writer = app.writer
     app.writer = new_writer
     app.conv = conversation
-    app.runtime.usage_anchor = 0
-    app.runtime.anchor_msg_len = 0
+    await app.runtime.reset_for_new_session(new_context)
+    app.skill_executor.bind(app.provider, conversation)
     if old_writer is not None:
         old_writer.close()
+
+    threshold = app.runtime.context_window - SUMMARY_RESERVE - AUTO_SAFETY_MARGIN
+    if estimate_tokens(0, messages, 0) > threshold:
+        definitions = (
+            app._tool_registry.read_only_definitions()
+            if app.mode() is Mode.PLAN
+            else app._tool_registry.definitions()
+        )
+        try:
+            await app.agent.run_force_compact(conversation, definitions, app.mode())
+        except Exception as exc:
+            app._write_notice(f"恢复会话时压缩失败，继续加载原历史：{exc}")
     app._cancel_resume()
+    await app._dispatch_session_resume()
     app._write_notice(f"已恢复会话 {info.id}，共 {conversation.length()} 条消息")
 
 

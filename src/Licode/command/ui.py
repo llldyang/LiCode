@@ -2,6 +2,7 @@
 
 from typing import Protocol
 
+from Licode.hook.rule import Rule as HookRule
 from Licode.permission import Mode
 from Licode.skills import SkillSummary
 
@@ -50,6 +51,10 @@ class UI(Protocol):
     def clear_active_skills(self) -> None: ...
 
     def append_assistant_message(self, text: str) -> None: ...
+
+    def hook_sources(self) -> list[str]: ...
+
+    def hook_rules(self) -> list[HookRule]: ...
 
 
 class NopUI:
@@ -120,3 +125,9 @@ class NopUI:
 
     def append_assistant_message(self, text: str) -> None:
         del text
+
+    def hook_sources(self) -> list[str]:
+        return []
+
+    def hook_rules(self) -> list[HookRule]:
+        return []

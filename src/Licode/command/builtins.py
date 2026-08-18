@@ -1,5 +1,6 @@
 """LiCode 内置斜杠命令清单。"""
 
+from .builtin_hooks import handle_hooks
 from .builtin_local import (
     handle_memory,
     handle_permission,
@@ -15,7 +16,7 @@ from .registry import Registry
 
 
 def register_builtins(registry: Registry) -> None:
-    """一次性注册全部 13 条内置命令。"""
+    """一次性注册全部 14 条内置命令。"""
 
     commands = (
         Command("clear", "清空当前对话并开启新会话", Kind.UI, handle_clear),
@@ -23,6 +24,7 @@ def register_builtins(registry: Registry) -> None:
         Command("do", "退出计划模式并开始执行", Kind.PROMPT, handle_do),
         Command("exit", "退出 LiCode", Kind.UI, handle_exit),
         Command("help", "列出所有可用命令", Kind.LOCAL, make_help_handler(registry)),
+        Command("hooks", "列出已加载的 Hook", Kind.LOCAL, handle_hooks),
         Command("memory", "列出已加载的记忆文件", Kind.LOCAL, handle_memory),
         Command("permission", "显示当前权限模式", Kind.LOCAL, handle_permission),
         Command("plan", "进入计划模式", Kind.UI, handle_plan),

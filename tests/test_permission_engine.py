@@ -3,11 +3,17 @@ from pathlib import Path
 
 from Licode.llm import ToolCall
 from Licode.permission import Category, Decision, Mode, mode_fallback, new_engine, parse_mode
+from Licode.permission.matcher import compile_matcher
 from Licode.permission.rule import Rule, RuleSet
 
 
 def call(name: str, **args: str) -> ToolCall:
     return ToolCall("call", name, json.dumps(args))
+
+
+def rule(tool: str, pattern: str, allow: bool) -> Rule:
+    matcher = compile_matcher(pattern, is_command=(tool == "Bash")) if pattern else None
+    return Rule(tool, matcher, allow, pattern)
 
 
 def test_mode_names_parser_and_fallback_matrix() -> None:
@@ -34,8 +40,8 @@ def test_blacklist_and_sandbox_precede_bypass_and_rules(tmp_path: Path) -> None:
     root.mkdir()
     engine, err = new_engine(str(root))
     assert err is None
-    engine.local.allow.append(Rule("Bash", "rm -rf /", True))
-    engine.local.allow.append(Rule("Read", "*", True))
+    engine.local.allow.append(rule("Bash", "rm -rf /", True))
+    engine.local.allow.append(rule("Read", "*", True))
 
     danger = engine.check(Mode.BYPASS, call("bash", command="rm -rf /"), False)
     outside = engine.check(Mode.BYPASS, call("read_file", path=str(tmp_path / "outside.txt")), True)
@@ -52,9 +58,9 @@ def test_blacklist_and_sandbox_precede_bypass_and_rules(tmp_path: Path) -> None:
 
 def test_rule_priority_exact_glob_and_mode_short_circuit(tmp_path: Path) -> None:
     engine, _ = new_engine(str(tmp_path))
-    engine.user = RuleSet(allow=[Rule("Bash", "git *", True)])
-    engine.project = RuleSet(allow=[Rule("Bash", "git push", True)])
-    engine.local = RuleSet(deny=[Rule("Bash", "git push", False)])
+    engine.user = RuleSet(allow=[rule("Bash", "git *", True)])
+    engine.project = RuleSet(allow=[rule("Bash", "git push", True)])
+    engine.local = RuleSet(deny=[rule("Bash", "git push", False)])
 
     assert engine.check(Mode.DEFAULT, call("bash", command="git status"), False) == (
         Decision.ALLOW,
@@ -64,20 +70,20 @@ def test_rule_priority_exact_glob_and_mode_short_circuit(tmp_path: Path) -> None
     assert denied[0] is Decision.DENY and "Bash(git push)" in denied[1]
     assert engine.check(Mode.DEFAULT, call("bash", command="npm test"), False)[0] is Decision.ASK
 
-    engine.local = RuleSet(allow=[Rule("Write", "src/**", True)])
+    engine.local = RuleSet(allow=[rule("Write", "src/**", True)])
     assert (
         engine.check(Mode.DEFAULT, call("write_file", path="src/a/b.py"), False)[0]
         is Decision.ALLOW
     )
     assert engine.check(Mode.DEFAULT, call("write_file", path="docs/x"), False)[0] is Decision.ASK
 
-    engine.local = RuleSet(allow=[Rule("Bash", "git push", True)])
-    engine.project = RuleSet(deny=[Rule("Bash", "git push", False)])
-    engine.user = RuleSet(deny=[Rule("Bash", "git push", False)])
+    engine.local = RuleSet(allow=[rule("Bash", "git push", True)])
+    engine.project = RuleSet(deny=[rule("Bash", "git push", False)])
+    engine.user = RuleSet(deny=[rule("Bash", "git push", False)])
     assert engine.check(Mode.DEFAULT, call("bash", command="git push"), False)[0] is Decision.ALLOW
 
     engine.local = RuleSet()
-    engine.project = RuleSet(allow=[Rule("Bash", "git push", True)])
+    engine.project = RuleSet(allow=[rule("Bash", "git push", True)])
     assert engine.check(Mode.DEFAULT, call("bash", command="git push"), False)[0] is Decision.ALLOW
 
     engine.project = RuleSet()
@@ -88,12 +94,12 @@ def test_friendly_rules_route_to_all_six_builtin_tools(tmp_path: Path) -> None:
     engine, _ = new_engine(str(tmp_path))
     engine.local = RuleSet(
         deny=[
-            Rule("Bash", "git status", False),
-            Rule("Read", "read.txt", False),
-            Rule("Write", "write.txt", False),
-            Rule("Edit", "edit.txt", False),
-            Rule("Glob", ".", False),
-            Rule("Grep", ".", False),
+            rule("Bash", "git status", False),
+            rule("Read", "read.txt", False),
+            rule("Write", "write.txt", False),
+            rule("Edit", "edit.txt", False),
+            rule("Glob", ".", False),
+            rule("Grep", ".", False),
         ]
     )
     samples = [

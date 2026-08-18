@@ -39,6 +39,11 @@ from Licode.compact import (
 )
 from Licode.config import ProviderConfig, effective_context_window
 from Licode.conversation import Conversation
+from Licode.hook import DispatchResult
+from Licode.hook import Engine as HookEngine
+from Licode.hook import Event as HookEvent
+from Licode.hook.rule import Payload
+from Licode.hook.rule import Rule as HookRule
 from Licode.llm import Provider, new_provider
 from Licode.memory import Manager as MemoryManager
 from Licode.permission import Engine, Mode, Outcome
@@ -181,6 +186,7 @@ class LiCodeApp(App[None]):
         sessions_dir: str | None = None,
         catalog: Catalog | None = None,
         install_skill_tool: InstallSkillTool | None = None,
+        hook_engine: HookEngine | None = None,
     ) -> None:
         super().__init__()
         self.state = SessionState.SELECTING if len(providers) > 1 else SessionState.IDLE
@@ -200,6 +206,9 @@ class LiCodeApp(App[None]):
             auto_tracking=CompactCircuitBreaker(),
             session=new_session_context(str(Path.cwd())),
         )
+        self.hook_engine = hook_engine
+        self.runtime.hook_engine = hook_engine
+        self._session_end_dispatched = False
         self.writer = writer
         self.memory_manager = memory_manager
         self.instruction_text = instruction_text
@@ -253,7 +262,7 @@ class LiCodeApp(App[None]):
         yield Static(id="completion", markup=True)
         yield Static(id="statusbar")
 
-    def on_mount(self) -> None:
+    async def on_mount(self) -> None:
         banner = render_banner(self.version, os.getcwd())
         self.query_one("#log", RichLog).write(banner)
         self._transcript.append(banner)
@@ -261,6 +270,7 @@ class LiCodeApp(App[None]):
             self._activate_provider(self.providers[0])
         else:
             self._show_provider_selection()
+        await self._dispatch_session_start()
 
     def _show_provider_selection(self) -> None:
         self.state = SessionState.SELECTING
@@ -292,6 +302,7 @@ class LiCodeApp(App[None]):
             memory_manager=self.memory_manager,
             instruction_text=self.instruction_text,
             memory_text=self.memory_text,
+            hook_engine=self.hook_engine,
         ).with_catalog(self.catalog)
         self.skill_executor.bind(self.provider, self.conv)
         self.state = SessionState.IDLE
@@ -332,7 +343,50 @@ class LiCodeApp(App[None]):
             return
         if self.state is not SessionState.IDLE:
             return
+        hook_result = await self._dispatch_hook(
+            HookEvent.USER_PROMPT_SUBMIT,
+            prompt=text,
+        )
+        if hook_result.blocked:
+            self._write_error(f"[hook {hook_result.blocking_hook_name}] {hook_result.reason}")
+            self.input_area.focus()
+            return
         await self._start_turn(text, text)
+
+    def _base_hook_payload(self, event: HookEvent) -> Payload:
+        return {
+            "event": event.value,
+            "session_id": self.runtime.session.session_id,
+            "cwd": self.workspace,
+            "mode": str(self._mode),
+        }
+
+    async def _dispatch_hook(
+        self,
+        event: HookEvent,
+        **fields: object,
+    ) -> DispatchResult:
+        if self.hook_engine is None:
+            return DispatchResult()
+        payload = self._base_hook_payload(event)
+        payload.update(fields)
+        result = await self.hook_engine.dispatch(event, payload)
+        self.runtime.append_reminders(result.injected_prompts)
+        return result
+
+    async def _dispatch_session_start(self) -> None:
+        self._session_end_dispatched = False
+        await self._dispatch_hook(HookEvent.SESSION_START)
+
+    async def dispatch_session_end(self) -> None:
+        if self._session_end_dispatched:
+            return
+        await self._dispatch_hook(HookEvent.SESSION_END)
+        self._session_end_dispatched = True
+
+    async def _dispatch_session_resume(self) -> None:
+        self._session_end_dispatched = False
+        await self._dispatch_hook(HookEvent.SESSION_RESUME)
 
     async def _start_turn(self, history_text: str, rendered_text: str) -> None:
         self.conv.add_user(history_text)
@@ -435,7 +489,11 @@ class LiCodeApp(App[None]):
         )
         self._write_notice("正在压缩上下文...")
         try:
-            before, after = await self.agent.run_force_compact(self.conv, definitions)
+            before, after = await self.agent.run_force_compact(
+                self.conv,
+                definitions,
+                self._mode,
+            )
         except Exception as exc:
             event = CompactEvent(phase=CompactPhase.AFTER_AUTO, err=exc)
         else:
@@ -446,6 +504,10 @@ class LiCodeApp(App[None]):
         begin_resume(self)
 
     def clear_and_new_session(self) -> None:
+        self._pending_command_task = asyncio.create_task(self._clear_and_new_session())
+
+    async def _clear_and_new_session(self) -> None:
+        await self.dispatch_session_end()
         if self.writer is not None:
             self.writer.close()
         session_context = new_session_context(self.workspace)
@@ -454,7 +516,7 @@ class LiCodeApp(App[None]):
             new_writer.set_model(self.provider.model)
         self.writer = new_writer
         self.conv = Conversation(new_writer.on_append, new_writer.on_replace)
-        self.runtime.reset_for_new_session(session_context)
+        await self.runtime.reset_for_new_session(session_context)
         if self.provider is not None:
             self.skill_executor.bind(self.provider, self.conv)
         self.iter = 0
@@ -465,6 +527,7 @@ class LiCodeApp(App[None]):
         self._transcript.clear()
         self.query_one("#log", RichLog).clear()
         self._update_status_bar()
+        await self._dispatch_session_start()
 
     def idle(self) -> bool:
         return self.state is SessionState.IDLE
@@ -483,6 +546,12 @@ class LiCodeApp(App[None]):
         rendered = assistant_block(text, 0.0)
         self.query_one("#log", RichLog).write(rendered)
         self._transcript.append(rendered)
+
+    def hook_sources(self) -> list[str]:
+        return self.hook_engine.sources if self.hook_engine is not None else []
+
+    def hook_rules(self) -> list[HookRule]:
+        return self.hook_engine.rules if self.hook_engine is not None else []
 
     def _reload_skill_commands(self) -> None:
         remove_skill_commands(self.cmd_registry)
@@ -634,6 +703,7 @@ class LiCodeApp(App[None]):
                 await self._stream_task
             except asyncio.CancelledError:
                 pass
+        await self.dispatch_session_end()
         self.exit()
 
     def action_cancel_turn(self) -> None:

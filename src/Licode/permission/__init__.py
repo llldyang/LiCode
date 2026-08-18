@@ -51,6 +51,14 @@ class ApprovalError(Exception):
 
 
 from .engine import Engine, mode_fallback, new_engine, start_mode  # noqa: E402
+from .matcher import (  # noqa: E402
+    ExactMatcher,
+    GlobMatcher,
+    Matcher,
+    NotMatcher,
+    RegexMatcher,
+    compile_matcher,
+)
 from .persist import persist_local_allow  # noqa: E402
 
 __all__ = [
@@ -58,8 +66,14 @@ __all__ = [
     "Category",
     "Decision",
     "Engine",
+    "ExactMatcher",
+    "GlobMatcher",
+    "Matcher",
     "Mode",
     "Outcome",
+    "NotMatcher",
+    "RegexMatcher",
+    "compile_matcher",
     "mode_fallback",
     "new_engine",
     "parse_mode",

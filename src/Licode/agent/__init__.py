@@ -25,6 +25,10 @@ from Licode.compact import (
 from Licode.compact.const import AUTO_SAFETY_MARGIN, MANUAL_SAFETY_MARGIN, SUMMARY_RESERVE
 from Licode.compact.token import estimate_tokens, usage_anchor
 from Licode.conversation import Conversation
+from Licode.hook import DispatchResult
+from Licode.hook import Engine as HookEngine
+from Licode.hook import Event as HookEvent
+from Licode.hook.rule import Payload
 from Licode.llm import (
     Message,
     PromptTooLongError,
@@ -89,6 +93,7 @@ class Agent:
         memory_manager: MemoryManager | None = None,
         instruction_text: str = "",
         memory_text: str = "",
+        hook_engine: HookEngine | None = None,
     ) -> None:
         self._provider = provider
         self._registry = registry
@@ -104,6 +109,8 @@ class Agent:
         self._instruction_text = instruction_text
         self._memory_text = memory_text
         self._catalog: Catalog | None = None
+        self._hook_engine = hook_engine or self.runtime.hook_engine
+        self.runtime.hook_engine = self._hook_engine
         self._run_lock = asyncio.Lock()
 
     def with_catalog(self, catalog: Catalog) -> Agent:
@@ -118,6 +125,40 @@ class Agent:
 
     def list_active_skills(self) -> list[str]:
         return self.runtime.active_skills.names()
+
+    async def _dispatch_hook(
+        self,
+        event: HookEvent,
+        mode: Mode,
+        **fields: Any,
+    ) -> DispatchResult:
+        if self._hook_engine is None:
+            return DispatchResult()
+        payload: Payload = {
+            "event": event.value,
+            "session_id": self.runtime.session.session_id,
+            "cwd": self._workspace(),
+            "mode": str(mode),
+            **fields,
+        }
+        result = await self._hook_engine.dispatch(event, payload)
+        self.runtime.append_reminders(result.injected_prompts)
+        return result
+
+    def _workspace(self) -> str:
+        session_path = Path(self.runtime.session.session_dir).resolve()
+        try:
+            return str(session_path.parents[2])
+        except IndexError:
+            return str(Path.cwd().resolve())
+
+    def _build_reminder(self, mode: Mode, iteration: int) -> str:
+        parts: list[str] = []
+        if mode is Mode.PLAN:
+            full = iteration == 1 or (iteration - 1) % PLAN_REMINDER_INTERVAL == 0
+            parts.append(prompt.plan_reminder(full))
+        parts.extend(self.runtime.take_reminders())
+        return "\n\n".join(part for part in parts if part)
 
     async def run(
         self, conv: Conversation, mode: Mode, cancel: asyncio.Event
@@ -173,6 +214,11 @@ class Agent:
             )
 
             manage_input = await self._manage_input(conv, definitions, TriggerKind.AUTO)
+            await self._dispatch_hook(
+                HookEvent.PRE_COMPACT,
+                mode,
+                trigger="auto",
+            )
             auto_threshold = manage_input.context_window - SUMMARY_RESERVE - AUTO_SAFETY_MARGIN
             will_summarize = (
                 manage_input.context_window > SUMMARY_RESERVE + AUTO_SAFETY_MARGIN
@@ -201,11 +247,22 @@ class Agent:
                     )
                 )
 
+            await self._dispatch_hook(
+                HookEvent.POST_COMPACT,
+                mode,
+                trigger="auto",
+                before_tokens=manage_output.before_tokens,
+                after_tokens=manage_output.after_tokens,
+            )
+
+            await self._dispatch_hook(
+                HookEvent.PRE_USER_MESSAGE,
+                mode,
+                prompt=self._last_user_prompt(conv),
+            )
+
             stream_queue: asyncio.Queue[Event] = asyncio.Queue(maxsize=1)
-            reminder = ""
-            if mode is Mode.PLAN:
-                full = iteration == 1 or (iteration - 1) % PLAN_REMINDER_INTERVAL == 0
-                reminder = prompt.plan_reminder(full)
+            reminder = self._build_reminder(mode, iteration)
             stream_task = asyncio.create_task(
                 self._stream_once(
                     conv,
@@ -236,6 +293,11 @@ class Agent:
                     definitions,
                     TriggerKind.EMERGENCY,
                 )
+                await self._dispatch_hook(
+                    HookEvent.PRE_COMPACT,
+                    mode,
+                    trigger="emergency",
+                )
                 try:
                     emergency_output = await manage_context(emergency_input)
                 except Exception as exc:
@@ -256,16 +318,35 @@ class Agent:
                         after=emergency_output.after_tokens,
                     )
                 )
+                await self._dispatch_hook(
+                    HookEvent.POST_COMPACT,
+                    mode,
+                    trigger="emergency",
+                    before_tokens=emergency_output.before_tokens,
+                    after_tokens=emergency_output.after_tokens,
+                )
                 async with self.runtime._lock:
                     self.runtime.usage_anchor = 0
                     self.runtime.anchor_msg_len = 0
                     context_window = self.runtime.context_window
                 estimate = estimate_tokens(0, conv.messages(), 0)
                 if estimate >= context_window - MANUAL_SAFETY_MARGIN:
+                    await self._dispatch_hook(
+                        HookEvent.NOTIFICATION,
+                        mode,
+                        kind="stream_error",
+                        detail=str(stream_error),
+                    )
                     yield Event(err=stream_error)
                     self._ensure_assistant_tail(conv, NOTICE_STREAM_ERR)
                     return
                 emergency_retried = True
+                await self._dispatch_hook(
+                    HookEvent.PRE_USER_MESSAGE,
+                    mode,
+                    prompt=self._last_user_prompt(conv),
+                )
+                reminder = self._build_reminder(mode, iteration)
                 retry_queue: asyncio.Queue[Event] = asyncio.Queue(maxsize=1)
                 retry_task = asyncio.create_task(
                     self._stream_once(
@@ -286,6 +367,12 @@ class Agent:
                     await self._stop_task(retry_task)
 
             if stream_error is not None:
+                await self._dispatch_hook(
+                    HookEvent.NOTIFICATION,
+                    mode,
+                    kind="stream_error",
+                    detail=str(stream_error),
+                )
                 yield Event(err=stream_error)
                 fallback = NOTICE_CANCELLED if cancel.is_set() else NOTICE_STREAM_ERR
                 self._ensure_assistant_tail(conv, fallback)
@@ -315,6 +402,7 @@ class Agent:
                     self.runtime.turn_count % 5 == 0 or self._has_memory_signal(recent_messages)
                 ):
                     asyncio.create_task(self._memory_manager.update_async(recent_messages))
+                await self._dispatch_hook(HookEvent.STOP, mode, iter=iteration)
                 yield Event(done=True)
                 return
 
@@ -351,11 +439,13 @@ class Agent:
             if unknown_run >= MAX_UNKNOWN_RUN:
                 yield Event(notice=NOTICE_UNKNOWN_TOOLS)
                 self._ensure_assistant_tail(conv, NOTICE_UNKNOWN_TOOLS)
+                await self._dispatch_hook(HookEvent.STOP, mode, iter=iteration)
                 yield Event(done=True)
                 return
 
         yield Event(notice=NOTICE_MAX_ITER)
         self._ensure_assistant_tail(conv, NOTICE_MAX_ITER)
+        await self._dispatch_hook(HookEvent.STOP, mode, iter=MAX_ITERATIONS)
         yield Event(done=True)
 
     async def _stream_once(
@@ -501,6 +591,7 @@ class Agent:
         self,
         conv: Conversation,
         tool_defs: list[ToolDefinition],
+        mode: Mode = Mode.DEFAULT,
     ) -> tuple[int, int]:
         """在主循环空闲时无条件执行一次手动摘要。"""
 
@@ -510,7 +601,19 @@ class Agent:
                 tool_defs,
                 TriggerKind.MANUAL,
             )
+            await self._dispatch_hook(
+                HookEvent.PRE_COMPACT,
+                mode,
+                trigger="manual",
+            )
             output = await manage_context(manage_input)
+            await self._dispatch_hook(
+                HookEvent.POST_COMPACT,
+                mode,
+                trigger="manual",
+                before_tokens=output.before_tokens,
+                after_tokens=output.after_tokens,
+            )
             async with self.runtime._lock:
                 self.runtime.usage_anchor = 0
                 self.runtime.anchor_msg_len = 0
@@ -534,16 +637,25 @@ class Agent:
                 end = index + 1
                 while end < len(calls) and self._registry.is_read_only(calls[end].name):
                     end += 1
-                for call in calls[index:end]:
-                    await push(self._start_event(call))
                 allowed: list[tuple[int, ToolCall]] = []
                 for call_index in range(index, end):
-                    decision, reason = self._engine.check(mode, calls[call_index], True)
+                    call = calls[call_index]
+                    await push(self._start_event(call))
+                    hook_result = await self._dispatch_hook(
+                        HookEvent.PRE_TOOL_USE,
+                        mode,
+                        tool_name=call.name,
+                        tool_input=self._tool_input(call),
+                    )
+                    if hook_result.blocked:
+                        results[call_index] = self._hook_blocked_result(call, hook_result)
+                        continue
+                    decision, reason = self._engine.check(mode, call, True)
                     if decision is Decision.ALLOW:
-                        allowed.append((call_index, calls[call_index]))
+                        allowed.append((call_index, call))
                     else:
                         results[call_index] = ToolResult(
-                            tool_call_id=calls[call_index].id,
+                            tool_call_id=call.id,
                             content=reason or "只读工具调用未获权限",
                             is_error=True,
                         )
@@ -559,7 +671,16 @@ class Agent:
                 for call_index in range(index, end):
                     stored_result = results[call_index]
                     if stored_result is not None:
-                        await push(self._end_result_event(calls[call_index], stored_result))
+                        call = calls[call_index]
+                        await self._dispatch_hook(
+                            HookEvent.POST_TOOL_USE,
+                            mode,
+                            tool_name=call.name,
+                            tool_input=self._tool_input(call),
+                            tool_result=stored_result.content,
+                            is_error=stored_result.is_error,
+                        )
+                        await push(self._end_result_event(call, stored_result))
                 if not completed:
                     self._fill_cancelled(results, calls, end)
                     return self._complete_results(results), False
@@ -568,30 +689,53 @@ class Agent:
 
             call = calls[index]
             await push(self._start_event(call))
-            decision, reason = self._engine.check(mode, call, False)
             completed = True
-            if decision is Decision.DENY:
-                result = Result(reason, is_error=True)
-            elif decision is Decision.ALLOW:
-                result, completed = await self._run_one(call, cancel)
+            hook_result = await self._dispatch_hook(
+                HookEvent.PRE_TOOL_USE,
+                mode,
+                tool_name=call.name,
+                tool_input=self._tool_input(call),
+            )
+            if hook_result.blocked:
+                tool_result = self._hook_blocked_result(call, hook_result)
             else:
-                try:
-                    outcome = await self._request_approval(call, reason, cancel, push)
-                except asyncio.CancelledError:
-                    result = Result(NOTICE_CANCELLED, is_error=True)
-                    completed = False
+                decision, reason = self._engine.check(mode, call, False)
+                if decision is Decision.DENY:
+                    result = Result(reason, is_error=True)
+                elif decision is Decision.ALLOW:
+                    result, completed = await self._run_one(call, cancel)
                 else:
-                    if outcome is Outcome.DENY_ONCE:
-                        result = Result("用户拒绝本次工具调用", is_error=True)
+                    await self._dispatch_hook(
+                        HookEvent.NOTIFICATION,
+                        mode,
+                        kind="approval",
+                        detail=call.name,
+                    )
+                    try:
+                        outcome = await self._request_approval(call, reason, cancel, push)
+                    except asyncio.CancelledError:
+                        result = Result(NOTICE_CANCELLED, is_error=True)
+                        completed = False
                     else:
-                        if outcome is Outcome.ALLOW_FOREVER:
-                            try:
-                                self._engine.persist_local_allow(call)
-                            except Exception as exc:
-                                logger.warning("永久权限规则写入失败: %s", exc)
-                        result, completed = await self._run_one(call, cancel)
-            tool_result = self._tool_result(call, result)
+                        if outcome is Outcome.DENY_ONCE:
+                            result = Result("用户拒绝本次工具调用", is_error=True)
+                        else:
+                            if outcome is Outcome.ALLOW_FOREVER:
+                                try:
+                                    self._engine.persist_local_allow(call)
+                                except Exception as exc:
+                                    logger.warning("永久权限规则写入失败: %s", exc)
+                            result, completed = await self._run_one(call, cancel)
+                tool_result = self._tool_result(call, result)
             results[index] = tool_result
+            await self._dispatch_hook(
+                HookEvent.POST_TOOL_USE,
+                mode,
+                tool_name=call.name,
+                tool_input=self._tool_input(call),
+                tool_result=tool_result.content,
+                is_error=tool_result.is_error,
+            )
             await push(self._end_result_event(call, tool_result))
             index += 1
             if not completed:
@@ -672,6 +816,29 @@ class Agent:
 
     def _all_unknown(self, calls: list[ToolCall]) -> bool:
         return all(self._registry.get(call.name) is None for call in calls)
+
+    @staticmethod
+    def _last_user_prompt(conv: Conversation) -> str:
+        for message in reversed(conv.messages()):
+            if message.role == "user":
+                return message.content
+        return ""
+
+    @staticmethod
+    def _tool_input(call: ToolCall) -> dict[str, Any]:
+        try:
+            value = json.loads(call.input or "{}")
+        except (json.JSONDecodeError, TypeError):
+            return {}
+        return value if isinstance(value, dict) else {}
+
+    @staticmethod
+    def _hook_blocked_result(call: ToolCall, result: DispatchResult) -> ToolResult:
+        return ToolResult(
+            tool_call_id=call.id,
+            content=f"[hook {result.blocking_hook_name}] {result.reason}",
+            is_error=True,
+        )
 
     @staticmethod
     def _ensure_assistant_tail(conv: Conversation, fallback: str) -> None:
@@ -755,6 +922,7 @@ def new_agent(
     memory_manager: MemoryManager | None = None,
     instruction_text: str = "",
     memory_text: str = "",
+    hook_engine: HookEngine | None = None,
 ) -> Agent:
     return Agent(
         provider,
@@ -765,6 +933,7 @@ def new_agent(
         memory_manager=memory_manager,
         instruction_text=instruction_text,
         memory_text=memory_text,
+        hook_engine=hook_engine,
     )
 
 

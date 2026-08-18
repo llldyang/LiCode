@@ -1,6 +1,7 @@
 """权限 YAML 配置、工具映射与调用参数提取。"""
 
 import json
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -70,8 +71,9 @@ def to_rule_set(settings: Settings) -> RuleSet:
         *((item, True) for item in settings.permissions.allow),
         *((item, False) for item in settings.permissions.deny),
     ):
-        rule, ok = parse_rule(value)
-        if not ok:
+        rule, error = parse_rule(value)
+        if rule is None:
+            print(f"rule {value!r} parse failed: {error}", file=sys.stderr)
             continue
         rule = with_allow(rule, allow)
         (result.allow if allow else result.deny).append(rule)

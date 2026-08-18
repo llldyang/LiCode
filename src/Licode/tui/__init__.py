@@ -2,6 +2,7 @@
 
 from Licode.agent import SessionRuntime
 from Licode.config import ProviderConfig
+from Licode.hook import Engine as HookEngine
 from Licode.memory import Manager as MemoryManager
 from Licode.permission import Engine
 from Licode.session import Writer
@@ -25,6 +26,7 @@ def new_app(
     sessions_dir: str | None = None,
     catalog: Catalog | None = None,
     install_skill_tool: InstallSkillTool | None = None,
+    hook_engine: HookEngine | None = None,
 ) -> LiCodeApp:
     return LiCodeApp(
         providers,
@@ -39,6 +41,7 @@ def new_app(
         sessions_dir,
         catalog,
         install_skill_tool,
+        hook_engine,
     )
 
 

@@ -5,6 +5,7 @@ import pytest
 
 from Licode.llm import ToolCall
 from Licode.permission import Category, Decision
+from Licode.permission.matcher import compile_matcher
 from Licode.permission.rule import Rule, RuleSet, escape_glob, match_pattern, parse_rule
 from Licode.permission.settings import (
     SettingsError,
@@ -17,12 +18,13 @@ from Licode.permission.settings import (
 
 
 def test_rule_parsing_and_command_file_globs() -> None:
-    command, ok = parse_rule("Bash(git *)")
-    whole_tool, whole_ok = parse_rule("Read")
+    command, error = parse_rule("Bash(git *)")
+    whole_tool, whole_error = parse_rule("Read")
 
-    assert ok and command.tool == "Bash" and command.pattern == "git *"
-    assert whole_ok and whole_tool.pattern == ""
-    assert not parse_rule("Bash(git *")[1]
+    assert error is None and command is not None and command.tool == "Bash"
+    assert command.raw == "git *" and command.matcher is not None
+    assert whole_error is None and whole_tool is not None and whole_tool.matcher is None
+    assert parse_rule("Bash(git *")[0] is None
     assert match_pattern("git *", "git status", is_file=False)
     assert not match_pattern("git *", "npm i", is_file=False)
     assert match_pattern("src/**", "src/a/b.py")
@@ -33,10 +35,25 @@ def test_rule_parsing_and_command_file_globs() -> None:
     assert not match_pattern(exact, "src/anything.py")
 
 
+@pytest.mark.parametrize(
+    ("raw", "hit", "miss"),
+    [
+        ("Bash(=git status)", "git status", "git status -s"),
+        ("Bash(~^npm (install|test)$)", "npm install", "npm run dev"),
+        ("Bash(!~^rm)", "ls -lh", "rm -rf ."),
+    ],
+)
+def test_permission_rule_uses_compiled_matcher(raw: str, hit: str, miss: str) -> None:
+    rule, error = parse_rule(raw)
+    assert error is None and rule is not None and rule.matcher is not None
+    assert rule.matcher.match(hit)
+    assert not rule.matcher.match(miss)
+
+
 def test_same_layer_deny_precedes_allow() -> None:
     rules = RuleSet(
-        allow=[Rule("Bash", "git *", True)],
-        deny=[Rule("Bash", "git push", False)],
+        allow=[Rule("Bash", compile_matcher("git *", is_command=True), True, "git *")],
+        deny=[Rule("Bash", compile_matcher("git push", is_command=True), False, "git push")],
     )
 
     assert rules.match("Bash", "git status") == (Decision.ALLOW, True)
@@ -46,8 +63,8 @@ def test_same_layer_deny_precedes_allow() -> None:
 
 def test_external_tool_name_glob_matches_allow_and_deny() -> None:
     rules = RuleSet(
-        allow=[Rule("mcp__demo__*", "", True)],
-        deny=[Rule("mcp__demo__remove", "", False)],
+        allow=[Rule("mcp__demo__*", None, True)],
+        deny=[Rule("mcp__demo__remove", None, False)],
     )
 
     assert rules.match("mcp__demo__echo", "") == (Decision.ALLOW, True)
@@ -55,7 +72,7 @@ def test_external_tool_name_glob_matches_allow_and_deny() -> None:
     assert rules.match("mcp__other__echo", "") == (Decision.ALLOW, False)
 
 
-def test_settings_load_mapping_and_invalid_entries(tmp_path: Path) -> None:
+def test_settings_load_mapping_and_invalid_entries(tmp_path: Path, capsys) -> None:
     path = tmp_path / "settings.yaml"
     path.write_text(
         "default_mode: acceptEdits\n"
@@ -70,6 +87,7 @@ def test_settings_load_mapping_and_invalid_entries(tmp_path: Path) -> None:
     assert settings.default_mode == "acceptEdits"
     assert len(rules.allow) == 1
     assert len(rules.deny) == 1
+    assert "rule 'broken(' parse failed" in capsys.readouterr().err
     assert load_settings(str(tmp_path / "missing.yaml")).permissions.allow == []
 
     path.write_text("permissions: [", encoding="utf-8")

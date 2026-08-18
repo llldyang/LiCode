@@ -20,8 +20,14 @@ from Licode.compact import (
     new_session_context,
 )
 from Licode.config import ProviderConfig
+from Licode.hook import Event as HookEvent
+from Licode.hook.engine import Engine as HookEngine
+from Licode.hook.executor import ExecutionResult
+from Licode.hook.rule import Action, ActionType, PromptAction
+from Licode.hook.rule import Rule as HookRule
 from Licode.llm import PromptTooLongError, Request, StreamEvent, ToolCall
 from Licode.permission import Engine, Mode
+from Licode.permission.matcher import compile_matcher
 from Licode.permission.rule import Rule
 from Licode.prompt import EXECUTE_DIRECTIVE
 from Licode.session import Writer, list_sessions
@@ -35,6 +41,7 @@ class FakeProvider:
     def __init__(self, scripts: list[list[StreamEvent]]) -> None:
         self.scripts = scripts
         self.call_count = 0
+        self.requests: list[Request] = []
 
     @property
     def name(self) -> str:
@@ -45,7 +52,7 @@ class FakeProvider:
         return "fake-model"
 
     async def stream(self, req: Request) -> AsyncIterator[StreamEvent]:
-        del req
+        self.requests.append(req)
         script = self.scripts[self.call_count]
         self.call_count += 1
         for event in script:
@@ -73,6 +80,7 @@ def make_app(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     provider: FakeProvider,
+    hook_engine: HookEngine | None = None,
 ) -> LiCodeApp:
     monkeypatch.setattr("Licode.tui.app.new_provider", lambda config: provider)
     return LiCodeApp(
@@ -80,6 +88,42 @@ def make_app(
         "test",
         new_default_registry(),
         permission_engine(tmp_path),
+        hook_engine=hook_engine,
+    )
+
+
+class RecordingHookExecutor:
+    def __init__(self, blocked_rule: str = "") -> None:
+        self.blocked_rule = blocked_rule
+        self.calls: list[tuple[str, HookEvent]] = []
+
+    async def run(self, rule: HookRule, payload: dict, *, blocking: bool) -> ExecutionResult:
+        del payload
+        self.calls.append((rule.name, rule.event))
+        if rule.name == self.blocked_rule and blocking:
+            return ExecutionResult(blocked=True, reason="blocked by tui hook")
+        if rule.action.prompt is not None:
+            return ExecutionResult(prompt=rule.action.prompt.text)
+        return ExecutionResult()
+
+    async def close(self) -> None:
+        return None
+
+
+def hook_rule(
+    name: str,
+    event: HookEvent,
+    text: str = "",
+    *,
+    once: bool = False,
+    background: bool = False,
+) -> HookRule:
+    return HookRule(
+        name,
+        event,
+        Action(ActionType.PROMPT, prompt=PromptAction(text)),
+        only_once=once,
+        asyncio_mode=background,
     )
 
 
@@ -111,7 +155,9 @@ async def test_shift_tab_cycles_modes_status_and_keeps_rules(
         ]
     )
     app = make_app(tmp_path, monkeypatch, provider)
-    app.engine.local.allow.append(Rule("Bash", "git status", True))
+    app.engine.local.allow.append(
+        Rule("Bash", compile_matcher("git status", is_command=True), True, "git status")
+    )
     expected = [
         (Mode.DEFAULT, "DEFAULT"),
         (Mode.ACCEPT_EDITS, "ACCEPT EDITS"),
@@ -273,7 +319,7 @@ async def test_compact_and_unknown_commands_do_not_enter_normal_chat(
         assert app.conv.length() == before
         assert "未知命令" in app._transcript[-1].plain
         assert "/help" in app._transcript[-1].plain
-        assert len(app.cmd_registry.visible()) == 13
+        assert len(app.cmd_registry.visible()) == 14
 
 
 @pytest.mark.asyncio
@@ -289,7 +335,7 @@ async def test_tui_dispatch_help_lists_all_builtins_without_llm(
 
         output = app._transcript[-1].plain
         lines = output.splitlines()
-        assert len(lines) == 13
+        assert len(lines) == 14
         assert [line.split()[0] for line in lines] == [
             f"/{command.name}" for command in app.cmd_registry.visible()
         ]
@@ -436,6 +482,122 @@ async def test_tui_clear_opens_new_session_and_keeps_old_archive(
 
 
 @pytest.mark.asyncio
+async def test_tui_session_start_prompt_reaches_first_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    recorder = RecordingHookExecutor()
+    hooks = HookEngine(
+        [hook_rule("zh-cn", HookEvent.SESSION_START, "SESSION_START_ZH_CN")],
+        [str(tmp_path / ".LiCode" / "hooks.yaml")],
+        recorder,  # type: ignore[arg-type]
+    )
+    provider = FakeProvider([[StreamEvent(text="中文回复"), StreamEvent(done=True)]])
+    app = make_app(tmp_path, monkeypatch, provider, hooks)
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app.submit("hi there")
+        await wait_for_state(pilot, app, SessionState.IDLE)
+
+    assert "SESSION_START_ZH_CN" in provider.requests[0].reminder
+    assert recorder.calls[0] == ("zh-cn", HookEvent.SESSION_START)
+
+
+@pytest.mark.asyncio
+async def test_tui_user_prompt_hook_blocks_and_preserves_input(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    recorder = RecordingHookExecutor(blocked_rule="warn-delete")
+    hooks = HookEngine(
+        [hook_rule("warn-delete", HookEvent.USER_PROMPT_SUBMIT)],
+        [],
+        recorder,  # type: ignore[arg-type]
+    )
+    provider = FakeProvider([])
+    app = make_app(tmp_path, monkeypatch, provider, hooks)
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.input_area.text = "please delete it"
+        await app.submit(app.input_area.text)
+        assert app.input_area.text == "please delete it"
+        assert app.conv.length() == 0
+        assert provider.call_count == 0
+        assert "[hook warn-delete] blocked by tui hook" in app._transcript[-1].plain
+
+
+@pytest.mark.asyncio
+async def test_tui_clear_dispatches_session_events_and_resets_only_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    recorder = RecordingHookExecutor()
+    hooks = HookEngine(
+        [
+            hook_rule("start-once", HookEvent.SESSION_START, once=True),
+            hook_rule("end", HookEvent.SESSION_END),
+        ],
+        [],
+        recorder,  # type: ignore[arg-type]
+    )
+    app = make_app(tmp_path, monkeypatch, FakeProvider([]), hooks)
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app.submit("/clear")
+
+    assert recorder.calls == [
+        ("start-once", HookEvent.SESSION_START),
+        ("end", HookEvent.SESSION_END),
+        ("start-once", HookEvent.SESSION_START),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_tui_quit_dispatches_session_end(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    recorder = RecordingHookExecutor()
+    hooks = HookEngine(
+        [hook_rule("end", HookEvent.SESSION_END)],
+        [],
+        recorder,  # type: ignore[arg-type]
+    )
+    app = make_app(tmp_path, monkeypatch, FakeProvider([]), hooks)
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app.action_quit()
+
+    assert recorder.calls == [("end", HookEvent.SESSION_END)]
+
+
+@pytest.mark.asyncio
+async def test_hooks_command_groups_rules_and_prints_sources(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    recorder = RecordingHookExecutor()
+    source = str(tmp_path / ".LiCode" / "hooks.yaml")
+    hooks = HookEngine(
+        [
+            hook_rule("start", HookEvent.SESSION_START, once=True),
+            hook_rule("after", HookEvent.POST_TOOL_USE, background=True),
+        ],
+        [source],
+        recorder,  # type: ignore[arg-type]
+    )
+    app = make_app(tmp_path, monkeypatch, FakeProvider([]), hooks)
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app.submit("/hooks")
+        output = app._transcript[-1].plain
+
+    assert "SessionStart:" in output and "start  SessionStart  prompt  [once]" in output
+    assert "PostToolUse:" in output and "after  PostToolUse  prompt  [async]" in output
+    assert f"Loaded from: {source}" in output
+
+
+@pytest.mark.asyncio
 async def test_tui_command_handler_exception_is_rendered(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -459,7 +621,7 @@ def test_completion_menu_filters_scrolls_and_handles_boundaries() -> None:
 
     menu.update("/", app_registry)
     assert menu.active
-    assert len(menu.items) == 13
+    assert len(menu.items) == 14
     assert len(menu.render(120).splitlines()) <= MAX_ROWS
 
     menu.update("/s", app_registry)
@@ -490,7 +652,7 @@ async def test_tui_completion_keys_execute_and_escape_preserves_input(
         await pilot.pause()
         app.input_area.text = "/"
         await pilot.pause()
-        assert app.completion.active and len(app.completion.items) == 13
+        assert app.completion.active and len(app.completion.items) == 14
         assert app.query_one("#completion", Static).styles.display == "block"
 
         app.input_area.text = "/s"
@@ -647,6 +809,16 @@ async def test_resume_search_cancel_restore_and_append(
     )
     current_writer = Writer(runtime.session.session_dir)
     provider = FakeProvider([[StreamEvent(text="恢复后回答"), StreamEvent(done=True)]])
+    recorder = RecordingHookExecutor()
+    hooks = HookEngine(
+        [
+            hook_rule("start", HookEvent.SESSION_START),
+            hook_rule("end", HookEvent.SESSION_END),
+            hook_rule("resume", HookEvent.SESSION_RESUME),
+        ],
+        [],
+        recorder,  # type: ignore[arg-type]
+    )
     monkeypatch.setattr("Licode.tui.app.new_provider", lambda config: provider)
     app = LiCodeApp(
         [provider_config()],
@@ -656,6 +828,7 @@ async def test_resume_search_cancel_restore_and_append(
         runtime,
         current_writer,
         sessions_dir=str(sessions_dir),
+        hook_engine=hooks,
     )
 
     async with app.run_test() as pilot:
@@ -685,6 +858,12 @@ async def test_resume_search_cancel_restore_and_append(
         after = len(history_path.read_text(encoding="utf-8").splitlines())
         assert after >= before + 2
         assert app.conv.messages()[-1].content == "恢复后回答"
+
+    assert recorder.calls[:3] == [
+        ("start", HookEvent.SESSION_START),
+        ("end", HookEvent.SESSION_END),
+        ("resume", HookEvent.SESSION_RESUME),
+    ]
 
     assert app.writer is not None
     app.writer.close()

@@ -1,19 +1,20 @@
-"""权限规则解析与精确/glob 匹配。"""
+"""权限规则解析与匹配。"""
 
-import re
 from dataclasses import dataclass, field, replace
 
 from . import Decision
+from .matcher import Matcher, compile_matcher, match_command, match_path
 
 
 @dataclass
 class Rule:
     tool: str
-    pattern: str
+    matcher: Matcher | None
     allow: bool
+    raw: str = ""
 
     def render(self) -> str:
-        return self.tool if not self.pattern else f"{self.tool}({self.pattern})"
+        return self.tool if self.matcher is None else f"{self.tool}({self.raw})"
 
 
 @dataclass
@@ -29,61 +30,49 @@ class RuleSet:
         is_file = friendly != "Bash"
         for rule in self.deny:
             if match_pattern(rule.tool, friendly, is_file=False) and match_pattern(
-                rule.pattern, target, is_file
+                rule.matcher, target, is_file
             ):
                 return Decision.DENY, rule
         for rule in self.allow:
             if match_pattern(rule.tool, friendly, is_file=False) and match_pattern(
-                rule.pattern, target, is_file
+                rule.matcher, target, is_file
             ):
                 return Decision.ALLOW, rule
         return Decision.ALLOW, None
 
 
-def parse_rule(value: str) -> tuple[Rule, bool]:
-    """解析 Tool 或 Tool(pattern) 形式的规则。"""
+def parse_rule(value: str) -> tuple[Rule | None, str | None]:
+    """解析 Tool 或 Tool(pattern)，并返回可观察的错误描述。"""
 
     text = value.strip()
     if not text:
-        return Rule("", "", False), False
+        return None, "empty rule"
     if "(" not in text and ")" not in text:
-        return Rule(text, "", False), True
+        return Rule(text, None, False, text), None
     if "(" not in text or not text.endswith(")"):
-        return Rule("", "", False), False
+        return None, "expected Tool(pattern)"
     tool, pattern = text.split("(", 1)
     tool = tool.strip()
     if not tool:
-        return Rule("", "", False), False
-    return Rule(tool, pattern[:-1], False), True
+        return None, "empty tool name"
+    raw = pattern[:-1]
+    if not raw:
+        return Rule(tool, None, False, raw), None
+    try:
+        matcher = compile_matcher(raw, is_command=(tool == "Bash"))
+    except ValueError as exc:
+        return None, str(exc)
+    return Rule(tool, matcher, False, raw), None
 
 
-def _glob_regex(pattern: str, is_file: bool) -> str:
-    parts: list[str] = []
-    index = 0
-    while index < len(pattern):
-        char = pattern[index]
-        if char == "\\" and index + 1 < len(pattern):
-            parts.append(re.escape(pattern[index + 1]))
-            index += 2
-            continue
-        if char == "*":
-            if index + 1 < len(pattern) and pattern[index + 1] == "*":
-                parts.append(".*")
-                index += 2
-            else:
-                parts.append("[^/]*" if is_file else ".*")
-                index += 1
-            continue
-        parts.append(re.escape(char))
-        index += 1
-    return "".join(parts)
+def match_pattern(pattern: Matcher | str | None, target: str, is_file: bool = True) -> bool:
+    """兼容旧调用点的匹配门面。"""
 
-
-def match_pattern(pattern: str, target: str, is_file: bool = True) -> bool:
-    if not pattern:
+    if pattern is None or pattern == "":
         return True
-    normalized_target = target.replace("\\", "/") if is_file else target
-    return re.fullmatch(_glob_regex(pattern, is_file), normalized_target) is not None
+    if isinstance(pattern, str):
+        return match_path(pattern, target) if is_file else match_command(pattern, target)
+    return pattern.match(target)
 
 
 def with_allow(rule: Rule, allow: bool) -> Rule:

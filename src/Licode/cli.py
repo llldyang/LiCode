@@ -7,7 +7,7 @@ from contextlib import suppress
 from datetime import timedelta
 from pathlib import Path
 
-from Licode import __version__, config, instructions, memory, permission, session, skills
+from Licode import __version__, config, hook, instructions, memory, permission, session, skills
 from Licode import mcp as mcp_client
 from Licode.agent import SessionRuntime
 from Licode.compact import (
@@ -27,6 +27,7 @@ async def _amain() -> int:
     writer: session.Writer | None = None
     cleanup_task: asyncio.Task[None] | None = None
     manager: mcp_client.Manager | None = None
+    hook_engine: hook.Engine | None = None
     app = None
     try:
         cfg = config.load(".Licode/config.yaml")
@@ -81,6 +82,7 @@ async def _amain() -> int:
         engine, engine_error = permission.new_engine(root)
         if engine_error is not None:
             print(f"权限引擎降级: {engine_error}", file=sys.stderr)
+        hook_engine = hook.load(root)
         app = new_app(
             cfg.providers,
             __version__,
@@ -94,6 +96,7 @@ async def _amain() -> int:
             sessions_dir,
             catalog,
             install_skill_tool,
+            hook_engine,
         )
         await app.run_async(inline=True, inline_no_clear=True)
         app.print_transcript()
@@ -103,6 +106,12 @@ async def _amain() -> int:
         print(f"LiCode 启动失败: {exc}", file=sys.stderr)
         return 1
     finally:
+        if app is not None:
+            with suppress(Exception):
+                await app.dispatch_session_end()
+        if hook_engine is not None:
+            with suppress(Exception):
+                await hook_engine.close()
         if manager is not None:
             await manager.close()
         writer_to_close = app.writer if app is not None else writer
