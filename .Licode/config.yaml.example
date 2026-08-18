@@ -14,3 +14,8 @@ providers:
   #   api_key: "请填写 OpenAI API 密钥"
   #   base_url: https://api.openai.com/v1
   #   context_window: 128000
+
+# 指令文件按项目根 LiCode.md、项目 .Licode/LiCode.md、用户 ~/.Licode/LiCode.md
+# 的顺序加载，前者优先级更高。
+# .Licode/sessions/ 保存可由 /resume 恢复的对话；.Licode/memory/ 保存项目长期记忆。
+# ~/.Licode/memory/ 保存跨项目通用的用户长期记忆。

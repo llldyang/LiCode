@@ -64,11 +64,11 @@ def fixed_modules() -> list[Module]:
     ]
 
 
-def optional_modules() -> list[Module]:
-    """返回本章只预留位置、不加载真实内容的可选模块。"""
+def optional_modules(instructions: str = "", memory: str = "") -> list[Module]:
+    """返回由当前项目上下文填充的可选模块。"""
 
     return [
-        Module("自定义指令", 80, ""),
+        Module("custom-instructions", 80, instructions),
         Module("已激活 Skill", 90, ""),
-        Module("长期记忆", 100, ""),
+        Module("long-term-memory", 100, memory),
     ]

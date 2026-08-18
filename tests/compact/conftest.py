@@ -75,7 +75,7 @@ def make_input(
         replacement=replacement or ContentReplacementState(),
         recovery=recovery or RecoveryState(),
         auto_tracking=tracking or CompactCircuitBreaker(),
-        session=SessionContext("test-session", str(spill_dir)),
+        session=SessionContext("test-session", str(tmp_path), str(spill_dir)),
         usage_anchor=0,
         anchor_msg_len=0,
         estimated_token=estimated,

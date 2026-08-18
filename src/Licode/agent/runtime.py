@@ -18,6 +18,7 @@ class SessionRuntime:
     auto_tracking: CompactCircuitBreaker
     session: SessionContext
     context_window: int = 200000
+    turn_count: int = 0
     usage_anchor: int = 0
     anchor_msg_len: int = 0
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)

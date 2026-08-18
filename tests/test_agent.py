@@ -87,6 +87,19 @@ class ProbeTool:
         return Result(content="probe:" + (args or "{}"))
 
 
+class FakeMemoryManager:
+    def __init__(self) -> None:
+        self.calls: list[list[Message]] = []
+        self.updated = asyncio.Event()
+
+    def load_index(self) -> str:
+        return "长期记忆索引"
+
+    async def update_async(self, messages: list[Message]) -> None:
+        self.calls.append(messages)
+        self.updated.set()
+
+
 def tool_event(call_id: str, name: str = "probe", args: str = "{}") -> list[StreamEvent]:
     return [
         StreamEvent(tool_calls=[ToolCall(id=call_id, name=name, input=args)]),
@@ -125,6 +138,63 @@ def compact_summary() -> str:
         + "\n".join(f"## {index} 小节" for index in range(1, 10))
         + "</summary>"
     )
+
+
+@pytest.mark.asyncio
+async def test_agent_injects_context_and_explicit_memory_signal(tmp_path: Path) -> None:
+    provider = FakeProvider([[StreamEvent(text="已记住"), StreamEvent(done=True)]])
+    memory_manager = FakeMemoryManager()
+    agent = Agent(
+        provider,
+        Registry(),
+        "test",
+        permission_engine(tmp_path),
+        runtime=session_runtime(tmp_path),
+        memory_manager=memory_manager,  # type: ignore[arg-type]
+        instruction_text="项目指令内容",
+        memory_text="启动记忆",
+    )
+    conversation = Conversation()
+    conversation.add_user("请记住使用中文")
+
+    async for _ in agent.run(conversation, Mode.DEFAULT, asyncio.Event()):
+        pass
+    await asyncio.wait_for(memory_manager.updated.wait(), timeout=1)
+
+    assert provider.call_count == 1
+    assert "项目指令内容" in provider.requests[0].system.stable
+    assert "长期记忆索引" in provider.requests[0].system.stable
+    assert [message.content for message in memory_manager.calls[0]] == [
+        "请记住使用中文",
+        "已记住",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_agent_updates_memory_every_five_turns(tmp_path: Path) -> None:
+    provider = FakeProvider(
+        [[StreamEvent(text=f"回答 {index}"), StreamEvent(done=True)] for index in range(5)]
+    )
+    memory_manager = FakeMemoryManager()
+    agent = Agent(
+        provider,
+        Registry(),
+        "test",
+        permission_engine(tmp_path),
+        runtime=session_runtime(tmp_path),
+        memory_manager=memory_manager,  # type: ignore[arg-type]
+    )
+    conversation = Conversation()
+
+    for index in range(5):
+        conversation.add_user(f"问题 {index}")
+        async for _ in agent.run(conversation, Mode.DEFAULT, asyncio.Event()):
+            pass
+    await asyncio.wait_for(memory_manager.updated.wait(), timeout=1)
+
+    assert agent.runtime.turn_count == 5
+    assert len(memory_manager.calls) == 1
+    assert memory_manager.calls[0][0].content == "问题 4"
 
 
 @pytest.mark.asyncio

@@ -24,6 +24,7 @@ from Licode.compact.const import AUTO_SAFETY_MARGIN, MANUAL_SAFETY_MARGIN, SUMMA
 from Licode.compact.token import estimate_tokens, usage_anchor
 from Licode.conversation import Conversation
 from Licode.llm import (
+    Message,
     PromptTooLongError,
     Provider,
     Request,
@@ -33,6 +34,7 @@ from Licode.llm import (
     ToolResult,
 )
 from Licode.llm import Usage as LLMUsage
+from Licode.memory import Manager as MemoryManager
 from Licode.permission import Decision, Engine, Mode, Outcome
 from Licode.tool import DEFAULT_TIMEOUT, Registry, Result
 
@@ -77,6 +79,9 @@ class Agent:
         engine: Engine,
         *,
         runtime: SessionRuntime | None = None,
+        memory_manager: MemoryManager | None = None,
+        instruction_text: str = "",
+        memory_text: str = "",
     ) -> None:
         self._provider = provider
         self._registry = registry
@@ -88,6 +93,9 @@ class Agent:
             auto_tracking=CompactCircuitBreaker(),
             session=new_session_context("."),
         )
+        self._memory_manager = memory_manager
+        self._instruction_text = instruction_text
+        self._memory_text = memory_text
         self._run_lock = asyncio.Lock()
 
     async def run(
@@ -103,7 +111,12 @@ class Agent:
         environment = await asyncio.to_thread(
             prompt.gather_environment, self._version, self._provider.model
         )
-        stable_system = prompt.build_system_prompt()
+        memory_text = (
+            self._memory_manager.load_index()
+            if self._memory_manager is not None
+            else self._memory_text
+        )
+        stable_system = prompt.build_system_prompt(self._instruction_text, memory_text)
         environment_text = environment.render()
 
         unknown_run = 0
@@ -255,6 +268,12 @@ class Agent:
                     yield Event(text=final)
                 conv.add_assistant(final)
                 await self._update_usage_anchor(conv, usage)
+                self.runtime.turn_count += 1
+                recent_messages = self._extract_recent_turn(conv)
+                if self._memory_manager is not None and (
+                    self.runtime.turn_count % 5 == 0 or self._has_memory_signal(recent_messages)
+                ):
+                    asyncio.create_task(self._memory_manager.update_async(recent_messages))
                 yield Event(done=True)
                 return
 
@@ -418,6 +437,24 @@ class Agent:
                 str(path),
                 data.decode("utf-8", errors="replace"),
             )
+
+    @staticmethod
+    def _extract_recent_turn(conv: Conversation) -> list[Message]:
+        messages = conv.messages()
+        for index in range(len(messages) - 1, -1, -1):
+            if messages[index].role == "user":
+                return messages[index:]
+        return messages
+
+    @staticmethod
+    def _has_memory_signal(messages: list[Message]) -> bool:
+        signals = ("记住", "记忆", "别忘", "remember", "memo")
+        return any(
+            signal in message.content.casefold()
+            for message in messages
+            if message.role == "user"
+            for signal in signals
+        )
 
     async def run_force_compact(
         self,
@@ -674,8 +711,20 @@ def new_agent(
     engine: Engine,
     *,
     runtime: SessionRuntime | None = None,
+    memory_manager: MemoryManager | None = None,
+    instruction_text: str = "",
+    memory_text: str = "",
 ) -> Agent:
-    return Agent(provider, registry, version, engine, runtime=runtime)
+    return Agent(
+        provider,
+        registry,
+        version,
+        engine,
+        runtime=runtime,
+        memory_manager=memory_manager,
+        instruction_text=instruction_text,
+        memory_text=memory_text,
+    )
 
 
 __all__ = [

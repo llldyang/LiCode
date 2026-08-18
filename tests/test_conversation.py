@@ -68,3 +68,34 @@ def test_replace_history_deep_copies_and_accepts_empty() -> None:
     assert conversation.messages() == []
     conversation.replace_history([])
     assert conversation.length() == 0
+
+
+def test_append_and_replace_callbacks_receive_copies() -> None:
+    appended: list[Message] = []
+    replaced: list[list[Message]] = []
+    conversation = Conversation(appended.append, replaced.append)
+
+    conversation.add_user("用户")
+    conversation.add_assistant("助手")
+    conversation.add_assistant_with_tool_calls(
+        "调用",
+        [ToolCall(id="call-1", name="read_file", input="{}")],
+    )
+    conversation.add_tool_results([ToolResult(tool_call_id="call-1", content="结果")])
+    conversation.replace_messages([Message(role="user", content="摘要")])
+
+    assert [message.role for message in appended] == ["user", "assistant", "assistant", "tool"]
+    assert replaced == [[Message(role="user", content="摘要")]]
+    appended[0].content = "外部修改"
+    replaced[0][0].content = "外部修改"
+    assert conversation.messages() == [Message(role="user", content="摘要")]
+
+
+def test_from_messages_copies_history_without_firing_callbacks() -> None:
+    appended: list[Message] = []
+    source = [Message(role="user", content="已有消息")]
+    conversation = Conversation.from_messages(source, appended.append)
+
+    source[0].content = "外部修改"
+    assert conversation.messages()[0].content == "已有消息"
+    assert appended == []

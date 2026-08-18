@@ -170,3 +170,15 @@ async def test_too_small_context_window_skips_auto_summary(tmp_path: Path) -> No
         )
     )
     assert provider.requests == []
+
+
+@pytest.mark.asyncio
+async def test_unchanged_layer1_does_not_replace_history(tmp_path: Path) -> None:
+    replacements: list[list[Message]] = []
+    conversation = Conversation(on_replace=replacements.append)
+    conversation.add_user("普通消息")
+    provider = FakeCompactProvider([])
+
+    await manage_context(make_input(tmp_path, provider, conversation, estimated=10))
+
+    assert replacements == []

@@ -61,12 +61,14 @@ async def manage_context(in_: ManageInput) -> ManageOutput:
         new_messages, _, after = await force_compact(in_)
         in_.conv.replace_history(new_messages)
     else:
+        current_messages = in_.conv.messages()
         layer1_out = offload_and_snip(
-            in_.conv.messages(),
+            current_messages,
             in_.replacement,
             in_.session,
         )
-        in_.conv.replace_history(layer1_out)
+        if layer1_out != current_messages:
+            in_.conv.replace_history(layer1_out)
         layer1_estimate = estimate_tokens(
             in_.usage_anchor,
             layer1_out,

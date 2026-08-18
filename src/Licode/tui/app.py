@@ -25,11 +25,14 @@ from Licode.compact import (
 from Licode.config import ProviderConfig, effective_context_window
 from Licode.conversation import Conversation
 from Licode.llm import Provider, new_provider
+from Licode.memory import Manager as MemoryManager
 from Licode.permission import Engine, Mode, Outcome
 from Licode.prompt import render_banner
+from Licode.session import SessionInfo, Writer
 from Licode.tool import Registry, new_default_registry
 
 from .commands import dispatch_command
+from .resume import begin_resume, do_resume_session, handle_resume_key, options_for
 from .select import provider_at, provider_options
 from .stream import consume_stream, tick
 from .view import (
@@ -48,6 +51,7 @@ class SessionState(Enum):
     IDLE = "idle"
     STREAMING = "streaming"
     APPROVING = "approving"
+    RESUMING = "resuming"
 
 
 @dataclass
@@ -114,6 +118,18 @@ class LiCodeApp(App[None]):
         width: 1fr;
         height: 1fr;
     }
+    #resume-select {
+        display: none;
+        width: 1fr;
+        height: 1fr;
+    }
+    #resume-search {
+        display: none;
+        width: 1fr;
+        height: 1;
+        padding: 0 1;
+        color: $text-muted;
+    }
     """
 
     BINDINGS = [
@@ -129,6 +145,11 @@ class LiCodeApp(App[None]):
         registry: Registry,
         engine: Engine,
         runtime: SessionRuntime | None = None,
+        writer: Writer | None = None,
+        memory_manager: MemoryManager | None = None,
+        instruction_text: str = "",
+        memory_text: str = "",
+        sessions_dir: str | None = None,
     ) -> None:
         super().__init__()
         self.state = SessionState.SELECTING if len(providers) > 1 else SessionState.IDLE
@@ -143,8 +164,17 @@ class LiCodeApp(App[None]):
             auto_tracking=CompactCircuitBreaker(),
             session=new_session_context(str(Path.cwd())),
         )
+        self.writer = writer
+        self.memory_manager = memory_manager
+        self.instruction_text = instruction_text
+        self.memory_text = memory_text
+        self.sessions_dir = sessions_dir or str(Path(self.runtime.session.session_dir).parent)
+        self.workspace = str(Path(self.sessions_dir).resolve().parents[1])
         self.agent: Agent | None = None
-        self.conv = Conversation()
+        self.conv = Conversation(
+            writer.on_append if writer is not None else None,
+            writer.on_replace if writer is not None else None,
+        )
         self.mode = engine.start_mode()
         self.iter = 0
         self.usage_in = 0
@@ -158,9 +188,13 @@ class LiCodeApp(App[None]):
         self._stream_task: asyncio.Task[None] | None = None
         self._timer: Timer | None = None
         self._transcript: list[RenderableType] = []
+        self.resume_sessions: list[SessionInfo] = []
+        self.resume_query = ""
 
     def compose(self) -> ComposeResult:
         yield OptionList(*provider_options(self.providers), id="provider-select")
+        yield OptionList(id="resume-select")
+        yield Static(id="resume-search")
         yield RichLog(id="log", wrap=True, markup=True)
         yield Static(id="streaming")
         yield Static("❯ Send a message...", id="input-hint")
@@ -185,6 +219,10 @@ class LiCodeApp(App[None]):
 
     def _activate_provider(self, cfg: ProviderConfig) -> None:
         self.provider = new_provider(cfg)
+        if self.writer is not None:
+            self.writer.set_model(self.provider.model)
+        if self.memory_manager is not None:
+            self.memory_manager.set_provider(self.provider, self.provider.model)
         self.runtime.context_window = effective_context_window(cfg)
         self.agent = new_agent(
             self.provider,
@@ -192,6 +230,9 @@ class LiCodeApp(App[None]):
             self.version,
             self.engine,
             runtime=self.runtime,
+            memory_manager=self.memory_manager,
+            instruction_text=self.instruction_text,
+            memory_text=self.memory_text,
         )
         self.state = SessionState.IDLE
         self.query_one("#provider-select", OptionList).styles.display = "none"
@@ -200,13 +241,27 @@ class LiCodeApp(App[None]):
         self._update_status_bar()
         self.query_one("#input", MessageInput).focus()
 
-    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+    async def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        if event.control.id == "resume-select":
+            info = next(
+                (item for item in self.resume_sessions if item.id == event.option.id),
+                None,
+            )
+            if info is not None:
+                await do_resume_session(self, info)
+            return
         self._activate_provider(provider_at(self.providers, event.option.id))
 
     async def on_message_input_submitted(self, event: MessageInput.Submitted) -> None:
         await self.submit(event.text)
 
     async def submit(self, text: str) -> None:
+        if text.strip() == "/resume" and self.state in {
+            SessionState.STREAMING,
+            SessionState.APPROVING,
+        }:
+            self._write_notice("请等待当前任务完成")
+            return
         if self.state is not SessionState.IDLE or not text.strip():
             return
         command = text.strip()
@@ -237,6 +292,39 @@ class LiCodeApp(App[None]):
         rendered_notice = notice_block(text)
         self.query_one("#log", RichLog).write(rendered_notice)
         self._transcript.append(rendered_notice)
+
+    def begin_resume(self) -> None:
+        begin_resume(self)
+
+    def _show_resume_selection(self) -> None:
+        self.state = SessionState.RESUMING
+        self.query_one("#resume-select", OptionList).styles.display = "block"
+        self.query_one("#resume-search", Static).styles.display = "block"
+        for selector in (
+            "#provider-select",
+            "#log",
+            "#streaming",
+            "#input-hint",
+            "#input",
+            "#statusbar",
+        ):
+            self.query_one(selector).styles.display = "none"
+        self.query_one("#resume-select", OptionList).focus()
+
+    def _cancel_resume(self) -> None:
+        self.state = SessionState.IDLE
+        self.query_one("#resume-select", OptionList).styles.display = "none"
+        self.query_one("#resume-search", Static).styles.display = "none"
+        for selector in ("#log", "#streaming", "#input-hint", "#input", "#statusbar"):
+            self.query_one(selector).styles.display = "block"
+        self.query_one("#input", MessageInput).focus()
+
+    def _refresh_resume_options(self) -> None:
+        option_list = self.query_one("#resume-select", OptionList)
+        option_list.clear_options()
+        option_list.add_options(options_for(self.resume_sessions, self.resume_query))
+        option_list.highlighted = 0 if option_list.option_count else None
+        self.query_one("#resume-search", Static).update(f"搜索: {self.resume_query}")
 
     async def _consume_agent_events(self) -> None:
         await consume_stream(self)
@@ -327,6 +415,9 @@ class LiCodeApp(App[None]):
         self.exit()
 
     def action_cancel_turn(self) -> None:
+        if self.state is SessionState.RESUMING:
+            self._cancel_resume()
+            return
         if self.state in {SessionState.STREAMING, SessionState.APPROVING}:
             self._deny_pending()
         if self.state in {SessionState.STREAMING, SessionState.APPROVING} and self.turn_cancel:
@@ -342,6 +433,9 @@ class LiCodeApp(App[None]):
         self._update_status_bar()
 
     def on_key(self, event: events.Key) -> None:
+        if self.state is SessionState.RESUMING:
+            handle_resume_key(self, event)
+            return
         if self.state is not SessionState.APPROVING:
             return
         key = event.key

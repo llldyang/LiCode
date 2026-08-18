@@ -3,17 +3,20 @@ import threading
 from pathlib import Path
 
 from Licode.compact import CompactCircuitBreaker, ContentReplacementState, RecoveryState
-from Licode.compact.state import new_session_context
+from Licode.compact.state import new_session_context, open_session_context, parse_session_time
 
 
 def test_new_session_context_creates_unique_directories(tmp_path: Path) -> None:
     first = new_session_context(str(tmp_path))
     second = new_session_context(str(tmp_path))
 
-    assert re.fullmatch(r"\d+-[0-9a-f]{8}", first.session_id)
+    assert re.fullmatch(r"\d{8}-\d{6}-[0-9a-f]{4}", first.session_id)
     assert first.session_id != second.session_id
+    assert Path(first.session_dir).is_dir()
     assert Path(first.spill_dir).is_dir()
     assert Path(second.spill_dir).is_dir()
+    assert open_session_context(str(tmp_path), first.session_id) == first
+    assert parse_session_time(first.session_id).strftime("%Y%m%d-%H%M%S") == first.session_id[:15]
 
 
 def test_new_session_context_random_fallback(tmp_path: Path, monkeypatch) -> None:
@@ -22,7 +25,7 @@ def test_new_session_context_random_fallback(tmp_path: Path, monkeypatch) -> Non
 
     monkeypatch.setattr("Licode.compact.state.secrets.token_hex", fail)
     context = new_session_context(str(tmp_path))
-    assert re.fullmatch(r"\d+-[0-9a-f]{8}", context.session_id)
+    assert re.fullmatch(r"\d{8}-\d{6}-[0-9a-f]{4}", context.session_id)
 
 
 def test_decision_ledger_freezes_kept_replaced_and_retries_skip() -> None:

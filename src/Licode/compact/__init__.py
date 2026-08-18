@@ -8,6 +8,8 @@ from .state import (
     RecoveryState,
     SessionContext,
     new_session_context,
+    open_session_context,
+    parse_session_time,
 )
 
 __all__ = [
@@ -21,4 +23,6 @@ __all__ = [
     "TriggerKind",
     "manage_context",
     "new_session_context",
+    "open_session_context",
+    "parse_session_time",
 ]

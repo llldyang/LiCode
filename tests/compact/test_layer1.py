@@ -13,7 +13,7 @@ def tool_message(*contents: tuple[str, str]) -> Message:
 
 
 def test_spill_single_is_idempotent(tmp_path: Path) -> None:
-    context = SessionContext("id", str(tmp_path))
+    context = SessionContext("id", str(tmp_path), str(tmp_path))
     spill_single(context, "call", "第一次")
     path = tmp_path / "call"
     modified = path.stat().st_mtime_ns
@@ -25,7 +25,7 @@ def test_spill_single_is_idempotent(tmp_path: Path) -> None:
 def test_single_large_result_is_offloaded_with_stable_preview(tmp_path: Path) -> None:
     content = "行\n" * 30000
     state = ContentReplacementState()
-    context = SessionContext("id", str(tmp_path))
+    context = SessionContext("id", str(tmp_path), str(tmp_path))
     messages = [tool_message(("large", content))]
 
     first = offload_and_snip(messages, state, context)
@@ -49,7 +49,7 @@ def test_single_threshold_uses_utf8_bytes(tmp_path: Path) -> None:
     output = offload_and_snip(
         [tool_message(("chinese", content))],
         ContentReplacementState(),
-        SessionContext("id", str(tmp_path)),
+        SessionContext("id", str(tmp_path), str(tmp_path)),
     )
     assert "[content offloaded]" in output[0].tool_results[0].content
 
@@ -59,7 +59,7 @@ def test_aggregate_offloads_largest_minimum_count(tmp_path: Path) -> None:
     output = offload_and_snip(
         [tool_message(*contents)],
         ContentReplacementState(),
-        SessionContext("id", str(tmp_path)),
+        SessionContext("id", str(tmp_path), str(tmp_path)),
     )
     replaced = [
         result for result in output[0].tool_results if "[content offloaded]" in result.content
@@ -78,7 +78,7 @@ def test_all_single_threshold_hits_are_excluded_from_aggregate(tmp_path: Path) -
     output = offload_and_snip(
         [tool_message(*contents)],
         ContentReplacementState(),
-        SessionContext("id", str(tmp_path)),
+        SessionContext("id", str(tmp_path), str(tmp_path)),
     )
     assert all("[content offloaded]" in result.content for result in output[0].tool_results)
 
@@ -95,7 +95,7 @@ def test_spill_failure_keeps_result_retryable(tmp_path: Path, monkeypatch) -> No
     monkeypatch.setattr("Licode.compact.layer1.spill_single", fail)
     state = ContentReplacementState()
     messages = [tool_message(("retry", "x" * 60000))]
-    context = SessionContext("id", str(tmp_path))
+    context = SessionContext("id", str(tmp_path), str(tmp_path))
 
     assert offload_and_snip(messages, state, context)[0].tool_results[0].content == "x" * 60000
     assert offload_and_snip(messages, state, context)[0].tool_results[0].content == "x" * 60000

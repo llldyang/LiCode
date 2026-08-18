@@ -3,8 +3,11 @@
 import asyncio
 import os
 import sys
+from contextlib import suppress
+from datetime import timedelta
+from pathlib import Path
 
-from Licode import __version__, config, permission
+from Licode import __version__, config, instructions, memory, permission, session
 from Licode import mcp as mcp_client
 from Licode.agent import SessionRuntime
 from Licode.compact import (
@@ -19,6 +22,10 @@ from Licode.tui import new_app
 
 
 async def _amain() -> int:
+    writer: session.Writer | None = None
+    cleanup_task: asyncio.Task[None] | None = None
+    manager: mcp_client.Manager | None = None
+    app = None
     try:
         cfg = config.load(".Licode/config.yaml")
     except ConfigError as exc:
@@ -27,31 +34,65 @@ async def _amain() -> int:
 
     try:
         root = os.getcwd()
+        instruction_text = instructions.Loader(root).load()
+        memory_manager = memory.Manager(
+            str(Path(root) / ".Licode" / "memory"),
+            str(Path.home() / ".Licode" / "memory"),
+            provider=None,
+            model="",
+        )
+        memory_text = memory_manager.load_index()
         runtime = SessionRuntime(
             replacement=ContentReplacementState(),
             recovery=RecoveryState(),
             auto_tracking=CompactCircuitBreaker(),
             session=new_session_context(root),
         )
+        writer = session.Writer(runtime.session.session_dir)
+        sessions_dir = str(Path(root) / ".Licode" / "sessions")
+        cleanup_task = asyncio.create_task(
+            asyncio.to_thread(
+                session.clean_expired,
+                sessions_dir,
+                timedelta(days=30),
+            )
+        )
         registry = new_default_registry()
         mcp_config = mcp_client.load_config(root)
         manager = await mcp_client.new_manager(mcp_config, version=__version__)
-        try:
-            for external_tool in manager.tools():
-                registry.register(external_tool)
-            engine, engine_error = permission.new_engine(root)
-            if engine_error is not None:
-                print(f"权限引擎降级: {engine_error}", file=sys.stderr)
-            app = new_app(cfg.providers, __version__, registry, engine, runtime)
-            await app.run_async(inline=True, inline_no_clear=True)
-            app.print_transcript()
-        finally:
-            await manager.close()
+        for external_tool in manager.tools():
+            registry.register(external_tool)
+        engine, engine_error = permission.new_engine(root)
+        if engine_error is not None:
+            print(f"权限引擎降级: {engine_error}", file=sys.stderr)
+        app = new_app(
+            cfg.providers,
+            __version__,
+            registry,
+            engine,
+            runtime,
+            writer,
+            memory_manager,
+            instruction_text,
+            memory_text,
+            sessions_dir,
+        )
+        await app.run_async(inline=True, inline_no_clear=True)
+        app.print_transcript()
     except KeyboardInterrupt:
         return 0
     except Exception as exc:
         print(f"LiCode 启动失败: {exc}", file=sys.stderr)
         return 1
+    finally:
+        if manager is not None:
+            await manager.close()
+        writer_to_close = app.writer if app is not None else writer
+        if writer_to_close is not None:
+            writer_to_close.close()
+        if cleanup_task is not None:
+            with suppress(Exception):
+                await cleanup_task
     return 0
 
 

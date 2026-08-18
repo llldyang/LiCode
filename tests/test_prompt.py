@@ -24,6 +24,15 @@ def test_empty_optional_modules_are_skipped_without_extra_blank_lines() -> None:
     assert all(module.content == "" for module in prompt.optional_modules())
 
 
+def test_instructions_and_memory_fill_optional_modules_in_priority_order() -> None:
+    stable = prompt.build_system_prompt("PROJECT RULE", "REMEMBER THIS")
+
+    assert "PROJECT RULE" in stable
+    assert "REMEMBER THIS" in stable
+    assert stable.index("PROJECT RULE") < stable.index("REMEMBER THIS")
+    assert prompt.build_system_prompt("", "") == prompt.build_system_prompt()
+
+
 def test_stable_system_is_deterministic_and_contains_tool_rules() -> None:
     first = prompt.build_system_prompt()
     second = prompt.build_system_prompt()

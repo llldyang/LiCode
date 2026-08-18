@@ -62,11 +62,21 @@ async def handle_compact(app: LiCodeApp) -> None:
     app._write_notice(format_compact_notice(event))
 
 
+async def handle_resume(app: LiCodeApp) -> None:
+    from .app import SessionState
+
+    if app.state is not SessionState.IDLE:
+        app._write_notice("请等待当前任务完成")
+        return
+    app.begin_resume()
+
+
 BUILTIN_COMMANDS: dict[str, CommandHandler] = {
     "/exit": handle_exit,
     "/plan": handle_plan,
     "/do": handle_do,
     "/compact": handle_compact,
+    "/resume": handle_resume,
 }
 
 

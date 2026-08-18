@@ -1,20 +1,28 @@
 import asyncio
 import io
 import json
+import time
 from collections.abc import AsyncIterator
 from pathlib import Path
 
 import pytest
 from rich.console import Console
 from textual.pilot import Pilot
-from textual.widgets import Static
+from textual.widgets import OptionList, Static
 
-from Licode.agent import CompactEvent, CompactPhase
+from Licode.agent import CompactEvent, CompactPhase, SessionRuntime
+from Licode.compact import (
+    CompactCircuitBreaker,
+    ContentReplacementState,
+    RecoveryState,
+    new_session_context,
+)
 from Licode.config import ProviderConfig
 from Licode.llm import PromptTooLongError, Request, StreamEvent, ToolCall
 from Licode.permission import Engine, Mode
 from Licode.permission.rule import Rule
 from Licode.prompt import EXECUTE_DIRECTIVE
+from Licode.session import Writer
 from Licode.tool import new_default_registry
 from Licode.tui.app import LiCodeApp, SessionState
 from Licode.tui.commands import BUILTIN_COMMANDS, format_compact_notice
@@ -262,7 +270,7 @@ async def test_compact_and_unknown_commands_do_not_enter_normal_chat(
         assert app.conv.length() == before
         assert "未知命令" in app._transcript[-1].plain
         assert "/compact" in app._transcript[-1].plain
-        assert len(BUILTIN_COMMANDS) == 4
+        assert len(BUILTIN_COMMANDS) == 5
 
 
 def test_compact_notice_format_is_shared() -> None:
@@ -335,3 +343,164 @@ async def test_tui_renders_emergency_compact_notices(
         assert "上下文撞墙，自动压缩中..." in notices
         assert any("已压缩，token 从" in notice for notice in notices)
         assert provider.call_count == 3
+
+
+@pytest.mark.asyncio
+async def test_resume_search_cancel_restore_and_append(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sessions_dir = tmp_path / ".Licode" / "sessions"
+    history_dir = sessions_dir / "20260817-120000-abcd"
+    history_dir.mkdir(parents=True)
+    old_ts = int(time.time()) - 7 * 60 * 60
+    history_path = history_dir / "conversation.jsonl"
+    history_path.write_text(
+        "\n".join(
+            json.dumps(entry, ensure_ascii=False)
+            for entry in (
+                {
+                    "role": "user",
+                    "content": "alpha 历史问题",
+                    "model": "fake-model",
+                    "ts": old_ts,
+                },
+                {"role": "assistant", "content": "历史回答", "ts": old_ts},
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    runtime = SessionRuntime(
+        replacement=ContentReplacementState(),
+        recovery=RecoveryState(),
+        auto_tracking=CompactCircuitBreaker(),
+        session=new_session_context(str(tmp_path)),
+    )
+    current_writer = Writer(runtime.session.session_dir)
+    provider = FakeProvider([[StreamEvent(text="恢复后回答"), StreamEvent(done=True)]])
+    monkeypatch.setattr("Licode.tui.app.new_provider", lambda config: provider)
+    app = LiCodeApp(
+        [provider_config()],
+        "test",
+        new_default_registry(),
+        permission_engine(tmp_path),
+        runtime,
+        current_writer,
+        sessions_dir=str(sessions_dir),
+    )
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app.submit("/resume")
+        assert app.state is SessionState.RESUMING
+        assert app.query_one("#resume-select", OptionList).option_count == 2
+        await pilot.press("a", "l", "p", "h", "a")
+        assert app.query_one("#resume-select", OptionList).option_count == 1
+        assert app.resume_query == "alpha"
+        await pilot.press("escape")
+        assert app.state is SessionState.IDLE
+        assert app.runtime.session.session_id != history_dir.name
+
+        await app.submit("/resume")
+        await pilot.press("a", "l", "p", "h", "a")
+        await pilot.press("enter")
+        await wait_for_state(pilot, app, SessionState.IDLE)
+        assert app.runtime.session.session_id == history_dir.name
+        assert app.conv.messages()[0].content == "alpha 历史问题"
+        assert "本会话已暂停" in app.conv.messages()[-1].content
+        assert "已恢复会话" in app._transcript[-1].plain
+
+        before = len(history_path.read_text(encoding="utf-8").splitlines())
+        await app.submit("继续")
+        await wait_for_state(pilot, app, SessionState.IDLE)
+        after = len(history_path.read_text(encoding="utf-8").splitlines())
+        assert after >= before + 2
+        assert app.conv.messages()[-1].content == "恢复后回答"
+
+    assert app.writer is not None
+    app.writer.close()
+
+
+@pytest.mark.asyncio
+async def test_resume_while_streaming_returns_notice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    provider = FakeProvider([[StreamEvent(text="完成"), StreamEvent(done=True)]])
+    app = make_app(tmp_path, monkeypatch, provider)
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.state = SessionState.STREAMING
+        await app.submit("/resume")
+        assert "请等待当前任务完成" in app._transcript[-1].plain
+        assert app.state is SessionState.STREAMING
+
+
+@pytest.mark.asyncio
+async def test_resume_over_token_limit_compacts_before_idle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sessions_dir = tmp_path / ".Licode" / "sessions"
+    history_dir = sessions_dir / "20260817-130000-babe"
+    history_dir.mkdir(parents=True)
+    history_path = history_dir / "conversation.jsonl"
+    entries = []
+    for index in range(12):
+        entries.extend(
+            (
+                {
+                    "role": "user",
+                    "content": f"beta {index} " + "u" * 2000,
+                    "model": "fake-model" if index == 0 else None,
+                    "ts": int(time.time()),
+                },
+                {
+                    "role": "assistant",
+                    "content": "a" * 2000,
+                    "ts": int(time.time()),
+                },
+            )
+        )
+    history_path.write_text(
+        "\n".join(json.dumps(entry, ensure_ascii=False) for entry in entries) + "\n",
+        encoding="utf-8",
+    )
+    runtime = SessionRuntime(
+        replacement=ContentReplacementState(),
+        recovery=RecoveryState(),
+        auto_tracking=CompactCircuitBreaker(),
+        session=new_session_context(str(tmp_path)),
+        context_window=34000,
+    )
+    current_writer = Writer(runtime.session.session_dir)
+    summary = "<analysis>草稿</analysis><summary>恢复摘要</summary>"
+    provider = FakeProvider([[StreamEvent(text=summary), StreamEvent(done=True)]])
+    monkeypatch.setattr("Licode.tui.app.new_provider", lambda config: provider)
+    config = provider_config()
+    config.context_window = 34000
+    app = LiCodeApp(
+        [config],
+        "test",
+        new_default_registry(),
+        permission_engine(tmp_path),
+        runtime,
+        current_writer,
+        sessions_dir=str(sessions_dir),
+    )
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app.submit("/resume")
+        await pilot.press("b", "e", "t", "a")
+        await pilot.press("enter")
+        await wait_for_state(pilot, app, SessionState.IDLE)
+
+        assert provider.call_count == 1
+        assert app.conv.length() < len(entries)
+        records = [
+            json.loads(line) for line in history_path.read_text(encoding="utf-8").splitlines()
+        ]
+        assert any(record.get("type") == "compact" for record in records)
+
+    assert app.writer is not None
+    app.writer.close()
