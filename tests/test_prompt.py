@@ -83,3 +83,21 @@ def test_system_and_plan_reminders_are_tagged_and_have_two_detail_levels() -> No
     assert full.startswith("<system-reminder>") and full.endswith("</system-reminder>")
     assert "/do" in full
     assert len(full) > len(concise)
+
+
+def test_ready_hint_only_uses_help_as_command_entry() -> None:
+    assert "/help" in prompt.READY_HINT
+    for command in (
+        "clear",
+        "compact",
+        "do",
+        "exit",
+        "memory",
+        "permission",
+        "plan",
+        "resume",
+        "review",
+        "session",
+        "status",
+    ):
+        assert f"/{command}" not in prompt.READY_HINT

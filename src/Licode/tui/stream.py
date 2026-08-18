@@ -8,8 +8,7 @@ from textual.widgets import RichLog
 
 from Licode.agent import ApprovalRequest, Phase
 
-from .commands import format_compact_notice
-from .view import error_block, notice_block, tool_line, tool_result_summary
+from .view import error_block, format_compact_notice, notice_block, tool_line, tool_result_summary
 
 if TYPE_CHECKING:
     from .app import LiCodeApp
@@ -23,7 +22,7 @@ async def consume_stream(app: "LiCodeApp") -> None:
             raise RuntimeError("本轮取消事件尚未初始化")
         if app.agent is None:
             raise RuntimeError("Agent 尚未初始化")
-        async for event in app.agent.run(app.conv, app.mode, app.turn_cancel):
+        async for event in app.agent.run(app.conv, app.mode(), app.turn_cancel):
             if isinstance(event, ApprovalRequest):
                 app._show_approval(event)
                 continue
@@ -57,8 +56,8 @@ async def consume_stream(app: "LiCodeApp") -> None:
                 app._transcript.extend((rendered_line, rendered_result))
                 app._refresh_streaming_view()
             if event.usage is not None:
-                app.usage_in += event.usage.input
-                app.usage_out += event.usage.output
+                app._usage_in += event.usage.input
+                app._usage_out += event.usage.output
                 app._update_status_bar()
             if event.notice:
                 rendered_notice = notice_block(event.notice)

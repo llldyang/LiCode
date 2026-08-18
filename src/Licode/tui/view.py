@@ -6,7 +6,7 @@ from rich.padding import Padding
 from rich.table import Table
 from rich.text import Text
 
-from Licode.agent import ApprovalRequest
+from Licode.agent import ApprovalRequest, CompactEvent, CompactPhase
 from Licode.permission import Mode
 
 
@@ -28,6 +28,16 @@ def error_block(error: Exception) -> Text:
 
 def notice_block(text: str) -> Text:
     return Text(text, style="dim")
+
+
+def format_compact_notice(event: CompactEvent) -> str:
+    if event.phase is CompactPhase.BEFORE_AUTO:
+        return "正在压缩上下文..."
+    if event.phase is CompactPhase.BEFORE_EMERGENCY:
+        return "上下文撞墙，自动压缩中..."
+    if event.err is not None:
+        return f"压缩失败：{event.err}"
+    return f"已压缩，token 从 {event.before} 降至 {event.after}"
 
 
 def tool_line(name: str, args: str) -> Text:

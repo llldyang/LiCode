@@ -11,6 +11,8 @@ from textual.pilot import Pilot
 from textual.widgets import OptionList, Static
 
 from Licode.agent import CompactEvent, CompactPhase, SessionRuntime
+from Licode.command import Command, Kind, Registry, register_builtins
+from Licode.command.builtin_prompt import REVIEW_DIRECTIVE
 from Licode.compact import (
     CompactCircuitBreaker,
     ContentReplacementState,
@@ -22,10 +24,11 @@ from Licode.llm import PromptTooLongError, Request, StreamEvent, ToolCall
 from Licode.permission import Engine, Mode
 from Licode.permission.rule import Rule
 from Licode.prompt import EXECUTE_DIRECTIVE
-from Licode.session import Writer
+from Licode.session import Writer, list_sessions
 from Licode.tool import new_default_registry
 from Licode.tui.app import LiCodeApp, SessionState
-from Licode.tui.commands import BUILTIN_COMMANDS, format_compact_notice
+from Licode.tui.complete import MAX_ROWS, CompletionMenu
+from Licode.tui.view import format_compact_notice
 
 
 class FakeProvider:
@@ -126,24 +129,24 @@ async def test_shift_tab_cycles_modes_status_and_keeps_rules(
                 assert app.state is SessionState.IDLE
                 assert len(app._transcript) == before + 1
                 assert "已切换到" in app._transcript[-1].plain
-            assert app.mode is mode
+            assert app.mode() is mode
             status = rendered_status(app)
             assert label in status
             assert "hidden-provider" not in status
         assert [rule.render() for rule in app.engine.local.allow] == ["Bash(git status)"]
 
         await pilot.press("shift+tab")
-        assert app.mode is Mode.ACCEPT_EDITS
+        assert app.mode() is Mode.ACCEPT_EDITS
         await app.submit("保持当前模式")
-        assert app.mode is Mode.ACCEPT_EDITS
+        assert app.mode() is Mode.ACCEPT_EDITS
         await wait_for_state(pilot, app, SessionState.IDLE)
-        assert app.mode is Mode.ACCEPT_EDITS
+        assert app.mode() is Mode.ACCEPT_EDITS
 
         await app.submit("/plan")
-        assert app.mode is Mode.PLAN
+        assert app.mode() is Mode.PLAN
         assert app.state is SessionState.IDLE
         await app.submit("/do")
-        assert app.mode is Mode.DEFAULT
+        assert app.mode() is Mode.DEFAULT
         assert app.conv.messages()[-1].content == EXECUTE_DIRECTIVE
         await wait_for_state(pilot, app, SessionState.IDLE)
 
@@ -269,8 +272,272 @@ async def test_compact_and_unknown_commands_do_not_enter_normal_chat(
         assert provider.call_count == 1
         assert app.conv.length() == before
         assert "未知命令" in app._transcript[-1].plain
-        assert "/compact" in app._transcript[-1].plain
-        assert len(BUILTIN_COMMANDS) == 5
+        assert "/help" in app._transcript[-1].plain
+        assert len(app.cmd_registry.visible()) == 12
+
+
+@pytest.mark.asyncio
+async def test_tui_dispatch_help_lists_all_builtins_without_llm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    provider = FakeProvider([])
+    app = make_app(tmp_path, monkeypatch, provider)
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app.submit("/help")
+
+        output = app._transcript[-1].plain
+        lines = output.splitlines()
+        assert len(lines) == 12
+        assert [line.split()[0] for line in lines] == [
+            f"/{command.name}" for command in app.cmd_registry.visible()
+        ]
+        assert provider.call_count == 0
+        assert app.conv.length() == 0
+
+
+@pytest.mark.asyncio
+async def test_tui_dispatch_is_case_insensitive_and_unknown_is_friendly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    provider = FakeProvider([])
+    app = make_app(tmp_path, monkeypatch, provider)
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app.submit("/Help")
+        mixed_case = app._transcript[-1].plain
+        await app.submit("/help")
+        assert app._transcript[-1].plain == mixed_case
+
+        before = app.conv.length()
+        await app.submit("/foobar")
+        assert "未知命令" in app._transcript[-1].plain
+        assert "/help" in app._transcript[-1].plain
+        assert app.conv.length() == before
+        assert provider.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_tui_local_status_session_permission_and_memory_outputs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    provider = FakeProvider([])
+    app = make_app(tmp_path, monkeypatch, provider)
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app.submit("/status")
+        status = app._transcript[-1].plain
+        positions = [
+            status.index(key)
+            for key in ("Mode:", "Tokens:", "Tools:", "Memories:", "Model:", "Directory:")
+        ]
+        assert positions == sorted(positions)
+        assert "6 enabled" in status
+
+        await app.submit("/permission")
+        assert app._transcript[-1].plain == "default"
+        await app.submit("/memory")
+        assert app._transcript[-1].plain == "无已加载的记忆文件"
+        await app.submit("/session")
+        assert "Session:" in app._transcript[-1].plain
+        assert "Path:" in app._transcript[-1].plain
+        assert provider.call_count == 0
+        assert app.usage_in() == app.usage_out() == 0
+
+
+@pytest.mark.asyncio
+async def test_tui_only_local_commands_run_while_busy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    provider = FakeProvider([])
+    app = make_app(tmp_path, monkeypatch, provider)
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.state = SessionState.STREAMING
+        await app.submit("/status")
+        assert "Mode:" in app._transcript[-1].plain
+
+        await app.submit("/plan")
+        assert "请等待当前任务完成" in app._transcript[-1].plain
+        assert app.mode() is Mode.DEFAULT
+        assert app.state is SessionState.STREAMING
+
+
+@pytest.mark.asyncio
+async def test_tui_prompt_commands_inject_real_user_messages(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    provider = FakeProvider(
+        [
+            [StreamEvent(text="执行完成"), StreamEvent(done=True)],
+            [StreamEvent(text="审查完成"), StreamEvent(done=True)],
+        ]
+    )
+    app = make_app(tmp_path, monkeypatch, provider)
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app.submit("/do")
+        await wait_for_state(pilot, app, SessionState.IDLE)
+        assert app.conv.messages()[0].content == EXECUTE_DIRECTIVE
+
+        await app.submit("/review")
+        await wait_for_state(pilot, app, SessionState.IDLE)
+        assert app.conv.messages()[2].content == REVIEW_DIRECTIVE
+        assert "审查" in app.conv.messages()[2].content
+        assert provider.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_tui_clear_opens_new_session_and_keeps_old_archive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = SessionRuntime(
+        replacement=ContentReplacementState(),
+        recovery=RecoveryState(),
+        auto_tracking=CompactCircuitBreaker(),
+        session=new_session_context(str(tmp_path)),
+    )
+    writer = Writer(runtime.session.session_dir)
+    provider = FakeProvider([])
+    monkeypatch.setattr("Licode.tui.app.new_provider", lambda config: provider)
+    app = LiCodeApp(
+        [provider_config()],
+        "test",
+        new_default_registry(),
+        permission_engine(tmp_path),
+        runtime,
+        writer,
+    )
+    old_id = runtime.session.session_id
+    old_path = writer.path
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.conv.add_user("旧会话内容")
+        app._usage_in = 100
+        app._usage_out = 20
+        await app.submit("/clear")
+
+        assert app.runtime.session.session_id != old_id
+        assert app.session_path() != old_path
+        assert app.conv.length() == 0
+        assert app.usage_in() == app.usage_out() == 0
+        assert "开启新 session" in app._transcript[-1].plain
+        assert Path(old_path).read_text(encoding="utf-8")
+        assert old_id in {item.id for item in list_sessions(app.sessions_dir)}
+
+    assert app.writer is not None
+    app.writer.close()
+
+
+@pytest.mark.asyncio
+async def test_tui_command_handler_exception_is_rendered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def broken(ui) -> None:
+        del ui
+        raise RuntimeError("命令失败")
+
+    app = make_app(tmp_path, monkeypatch, FakeProvider([]))
+    app.cmd_registry.register(Command("broken", "失败命令", Kind.LOCAL, broken))
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app.submit("/broken")
+        assert "命令失败" in app._transcript[-1].plain
+
+
+def test_completion_menu_filters_scrolls_and_handles_boundaries() -> None:
+    app_registry = Registry()
+    register_builtins(app_registry)
+    menu = CompletionMenu()
+
+    menu.update("/", app_registry)
+    assert menu.active
+    assert len(menu.items) == 12
+    assert len(menu.render(120).splitlines()) <= MAX_ROWS
+
+    menu.update("/s", app_registry)
+    assert [item.name for item in menu.items] == ["session", "status"]
+    menu.move_down()
+    assert menu.selected() is not None and menu.selected().name == "status"
+    menu.move_up()
+    assert menu.selected() is not None and menu.selected().name == "session"
+
+    menu.update("/missing", app_registry)
+    assert menu.active and menu.selected() is None
+    assert "无匹配" in menu.render(120)
+    menu.update("/help\nnext", app_registry)
+    assert not menu.active
+    menu.update("hello", app_registry)
+    assert not menu.active
+
+
+@pytest.mark.asyncio
+async def test_tui_completion_keys_execute_and_escape_preserves_input(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = make_app(tmp_path, monkeypatch, FakeProvider([]))
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.input_area.text = "/"
+        await pilot.pause()
+        assert app.completion.active and len(app.completion.items) == 12
+        assert app.query_one("#completion", Static).styles.display == "block"
+
+        app.input_area.text = "/s"
+        await pilot.pause()
+        assert [item.name for item in app.completion.items] == ["session", "status"]
+        await pilot.press("down", "enter")
+        await pilot.pause()
+        assert "Mode:" in app._transcript[-1].plain
+        assert app.input_area.text == ""
+        assert not app.completion.active
+
+        app.input_area.text = "/s"
+        await pilot.pause()
+        await pilot.press("escape")
+        assert app.input_area.text == "/s"
+        assert not app.completion.active
+
+        app.input_area.text = ""
+        await pilot.pause()
+        assert not app.completion.active
+
+        app.input_area.text = "/s"
+        await pilot.pause()
+        await pilot.press("tab")
+        await pilot.pause()
+        assert "Session:" in app._transcript[-1].plain
+        assert app.input_area.text == ""
+
+
+@pytest.mark.asyncio
+async def test_tui_zero_match_enter_runs_unknown_and_tab_only_closes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = make_app(tmp_path, monkeypatch, FakeProvider([]))
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.input_area.text = "/missing"
+        await pilot.pause()
+        before = len(app._transcript)
+        await pilot.press("tab")
+        assert not app.completion.active
+        assert len(app._transcript) == before
+
+        app.input_area.text = "/missing"
+        await pilot.pause()
+        await pilot.press("enter")
+        await pilot.pause()
+        assert "未知命令" in app._transcript[-1].plain
 
 
 def test_compact_notice_format_is_shared() -> None:

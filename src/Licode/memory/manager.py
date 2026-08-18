@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 from dataclasses import asdict
+from pathlib import Path
 
 from Licode.llm import Message, Provider, Request, System
 
@@ -52,6 +53,26 @@ class Manager:
     def set_provider(self, provider: Provider, model: str) -> None:
         self._provider = provider
         self._model = model
+
+    def list_files(self) -> tuple[list[str], list[str]]:
+        """按项目层、用户层返回已加载目录中的 Markdown 文件名。"""
+
+        return self._list_store_files(self.project_store.dir), self._list_store_files(
+            self.user_store.dir
+        )
+
+    @staticmethod
+    def _list_store_files(directory: str) -> list[str]:
+        path = Path(directory)
+        try:
+            return sorted(
+                item.name for item in path.iterdir() if item.is_file() and item.suffix == ".md"
+            )
+        except FileNotFoundError:
+            return []
+        except OSError as exc:
+            logger.warning("列出记忆文件失败 %s: %s", path, exc)
+            return []
 
     async def update_async(self, recent_msgs: list[Message]) -> None:
         async with self._lock:

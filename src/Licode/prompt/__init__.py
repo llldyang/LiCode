@@ -7,7 +7,7 @@ from .reminder import EXECUTE_DIRECTIVE, plan_reminder, system_reminder
 CAT_BANNER = r""" /\_/\\
 ( o.o )
  > ^ <"""
-READY_HINT = "Ready for your request."
+READY_HINT = "Ready for your request. 输入 /help 查看可用命令。"
 
 
 def assemble_system(modules: list[Module]) -> str:

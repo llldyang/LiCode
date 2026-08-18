@@ -22,3 +22,14 @@ class SessionRuntime:
     usage_anchor: int = 0
     anchor_msg_len: int = 0
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+
+    def reset_for_new_session(self, session: SessionContext) -> None:
+        """保留模型窗口配置，并重置所有会话级状态。"""
+
+        self.replacement = ContentReplacementState()
+        self.recovery = RecoveryState()
+        self.auto_tracking = CompactCircuitBreaker()
+        self.session = session
+        self.turn_count = 0
+        self.usage_anchor = 0
+        self.anchor_msg_len = 0

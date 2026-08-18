@@ -91,7 +91,7 @@ async def do_resume_session(app: LiCodeApp, info: SessionInfo) -> None:
         if estimate_tokens(0, messages, 0) > threshold:
             definitions = (
                 app._tool_registry.read_only_definitions()
-                if app.mode is Mode.PLAN
+                if app.mode() is Mode.PLAN
                 else app._tool_registry.definitions()
             )
             try:

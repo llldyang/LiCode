@@ -20,6 +20,7 @@ def test_registry_exports_six_definitions_in_order() -> None:
     ]
     assert registry.get("read_file") is not None
     assert registry.get("missing") is None
+    assert registry.count() == 6
     assert [definition.name for definition in registry.read_only_definitions()] == [
         "read_file",
         "glob",

@@ -24,6 +24,9 @@ class Registry:
     def get(self, name: str) -> Tool | None:
         return self._tools.get(name)
 
+    def count(self) -> int:
+        return len(self._tools)
+
     def definitions(self) -> list[ToolDefinition]:
         return [self._definition(name) for name in self._order]
 

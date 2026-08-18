@@ -11,11 +11,21 @@ from rich.console import Console, RenderableType
 from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
+from textual.css.query import NoMatches
 from textual.message import Message as TextualMessage
 from textual.timer import Timer
 from textual.widgets import OptionList, RichLog, Static, TextArea
 
-from Licode.agent import Agent, ApprovalRequest, SessionRuntime, new_agent
+from Licode.agent import (
+    Agent,
+    ApprovalRequest,
+    CompactEvent,
+    CompactPhase,
+    SessionRuntime,
+    new_agent,
+)
+from Licode.command import Command, register_builtins
+from Licode.command import Registry as CommandRegistry
 from Licode.compact import (
     CompactCircuitBreaker,
     ContentReplacementState,
@@ -29,9 +39,11 @@ from Licode.memory import Manager as MemoryManager
 from Licode.permission import Engine, Mode, Outcome
 from Licode.prompt import render_banner
 from Licode.session import SessionInfo, Writer
-from Licode.tool import Registry, new_default_registry
+from Licode.tool import Registry as ToolRegistry
+from Licode.tool import new_default_registry
 
-from .commands import dispatch_command
+from .commands import dispatch_slash
+from .complete import CompletionMenu, handle_completion_key
 from .resume import begin_resume, do_resume_session, handle_resume_key, options_for
 from .select import provider_at, provider_options
 from .stream import consume_stream, tick
@@ -39,6 +51,7 @@ from .view import (
     approval_block,
     assistant_block,
     error_block,
+    format_compact_notice,
     notice_block,
     status_bar,
     streaming_block,
@@ -113,6 +126,14 @@ class LiCodeApp(App[None]):
         padding: 0 1;
         background: $panel;
     }
+    #completion {
+        display: none;
+        width: 1fr;
+        height: auto;
+        max-height: 8;
+        padding: 0 1;
+        background: $panel;
+    }
     #provider-select {
         display: none;
         width: 1fr;
@@ -142,7 +163,7 @@ class LiCodeApp(App[None]):
         self,
         providers: list[ProviderConfig],
         version: str,
-        registry: Registry,
+        registry: ToolRegistry,
         engine: Engine,
         runtime: SessionRuntime | None = None,
         writer: Writer | None = None,
@@ -157,6 +178,11 @@ class LiCodeApp(App[None]):
         self.version = version
         self.provider: Provider | None = None
         self._tool_registry = registry
+        self.cmd_registry = CommandRegistry()
+        register_builtins(self.cmd_registry)
+        self.completion = CompletionMenu()
+        self._pending_println: list[str] = []
+        self._pending_command_task: asyncio.Task[None] | None = None
         self.engine = engine
         self.runtime = runtime or SessionRuntime(
             replacement=ContentReplacementState(),
@@ -175,10 +201,10 @@ class LiCodeApp(App[None]):
             writer.on_append if writer is not None else None,
             writer.on_replace if writer is not None else None,
         )
-        self.mode = engine.start_mode()
+        self._mode = engine.start_mode()
         self.iter = 0
-        self.usage_in = 0
-        self.usage_out = 0
+        self._usage_in = 0
+        self._usage_out = 0
         self.cur_reply = ""
         self.cur_tools: list[ToolDisplay] = []
         self.turn_cancel: asyncio.Event | None = None
@@ -199,6 +225,7 @@ class LiCodeApp(App[None]):
         yield Static(id="streaming")
         yield Static("❯ Send a message...", id="input-hint")
         yield MessageInput(id="input", show_line_numbers=False)
+        yield Static(id="completion", markup=True)
         yield Static(id="statusbar")
 
     def on_mount(self) -> None:
@@ -213,7 +240,14 @@ class LiCodeApp(App[None]):
     def _show_provider_selection(self) -> None:
         self.state = SessionState.SELECTING
         self.query_one("#provider-select", OptionList).styles.display = "block"
-        for selector in ("#log", "#streaming", "#input-hint", "#input", "#statusbar"):
+        for selector in (
+            "#log",
+            "#streaming",
+            "#input-hint",
+            "#input",
+            "#completion",
+            "#statusbar",
+        ):
             self.query_one(selector).styles.display = "none"
         self.query_one("#provider-select", OptionList).focus()
 
@@ -238,6 +272,7 @@ class LiCodeApp(App[None]):
         self.query_one("#provider-select", OptionList).styles.display = "none"
         for selector in ("#log", "#streaming", "#input-hint", "#input", "#statusbar"):
             self.query_one(selector).styles.display = "block"
+        self._render_completion()
         self._update_status_bar()
         self.query_one("#input", MessageInput).focus()
 
@@ -253,22 +288,23 @@ class LiCodeApp(App[None]):
         self._activate_provider(provider_at(self.providers, event.option.id))
 
     async def on_message_input_submitted(self, event: MessageInput.Submitted) -> None:
+        if self.completion.active:
+            selected = self.completion.selected()
+            if selected is not None:
+                await self._execute_selected(selected)
+                return
         await self.submit(event.text)
 
     async def submit(self, text: str) -> None:
-        if text.strip() == "/resume" and self.state in {
-            SessionState.STREAMING,
-            SessionState.APPROVING,
-        }:
-            self._write_notice("请等待当前任务完成")
-            return
-        if self.state is not SessionState.IDLE or not text.strip():
-            return
         command = text.strip()
-        handler, handled = dispatch_command(command)
-        if handled and handler is not None:
-            self.query_one("#input", MessageInput).text = ""
-            await handler(self)
+        if not command:
+            return
+        if await self.dispatch_slash(command):
+            self.input_area.text = ""
+            self.completion.hide()
+            self._render_completion()
+            return
+        if self.state is not SessionState.IDLE:
             return
         await self._start_turn(text, text)
 
@@ -293,6 +329,142 @@ class LiCodeApp(App[None]):
         self.query_one("#log", RichLog).write(rendered_notice)
         self._transcript.append(rendered_notice)
 
+    def _write_error(self, text: str) -> None:
+        rendered_error = error_block(RuntimeError(text))
+        self.query_one("#log", RichLog).write(rendered_error)
+        self._transcript.append(rendered_error)
+
+    @property
+    def input_area(self) -> MessageInput:
+        return self.query_one("#input", MessageInput)
+
+    async def dispatch_slash(self, text: str) -> bool:
+        return await dispatch_slash(self, text)
+
+    def println(self, msg: str) -> None:
+        self._pending_println.append(msg)
+
+    def error(self, msg: str) -> None:
+        self._pending_println.append(f"ERROR\x00{msg}")
+
+    def _flush_command_output(self) -> None:
+        for message in self._pending_println:
+            if message.startswith("ERROR\x00"):
+                self._write_error(message.removeprefix("ERROR\x00"))
+            else:
+                self._write_notice(message)
+        self._pending_println.clear()
+
+    def mode(self) -> Mode:
+        return self._mode
+
+    def set_mode(self, mode: Mode) -> None:
+        self._mode = mode
+        self._update_status_bar()
+
+    def inject_and_send(self, display_label: str, preset_prompt: str) -> None:
+        asyncio.create_task(self._start_turn(preset_prompt, display_label))
+
+    def usage_in(self) -> int:
+        return self._usage_in
+
+    def usage_out(self) -> int:
+        return self._usage_out
+
+    def model_name(self) -> str:
+        return self.provider.model if self.provider is not None else ""
+
+    def cwd(self) -> str:
+        return self.workspace
+
+    def tool_count(self) -> int:
+        return self._tool_registry.count()
+
+    def memory_files(self) -> list[str]:
+        if self.memory_manager is None:
+            return []
+        project, user = self.memory_manager.list_files()
+        return project + user
+
+    def session_path(self) -> str:
+        return self.writer.path if self.writer is not None else ""
+
+    def session_id(self) -> str:
+        return self.runtime.session.session_id if self.runtime is not None else ""
+
+    def quit(self) -> None:
+        asyncio.create_task(self.action_quit())
+
+    def force_compact(self) -> None:
+        self._pending_command_task = asyncio.create_task(self._run_force_compact())
+
+    async def _run_force_compact(self) -> None:
+        if self.agent is None:
+            self._write_error("agent 未就绪")
+            return
+        definitions = (
+            self._tool_registry.read_only_definitions()
+            if self._mode is Mode.PLAN
+            else self._tool_registry.definitions()
+        )
+        self._write_notice("正在压缩上下文...")
+        try:
+            before, after = await self.agent.run_force_compact(self.conv, definitions)
+        except Exception as exc:
+            event = CompactEvent(phase=CompactPhase.AFTER_AUTO, err=exc)
+        else:
+            event = CompactEvent(phase=CompactPhase.AFTER_AUTO, before=before, after=after)
+        self._write_notice(format_compact_notice(event))
+
+    def open_resume_menu(self) -> None:
+        begin_resume(self)
+
+    def clear_and_new_session(self) -> None:
+        if self.writer is not None:
+            self.writer.close()
+        session_context = new_session_context(self.workspace)
+        new_writer = Writer(session_context.session_dir)
+        if self.provider is not None:
+            new_writer.set_model(self.provider.model)
+        self.writer = new_writer
+        self.conv = Conversation(new_writer.on_append, new_writer.on_replace)
+        self.runtime.reset_for_new_session(session_context)
+        self.iter = 0
+        self._usage_in = 0
+        self._usage_out = 0
+        self.cur_reply = ""
+        self.cur_tools = []
+        self._transcript.clear()
+        self.query_one("#log", RichLog).clear()
+        self._update_status_bar()
+
+    def idle(self) -> bool:
+        return self.state is SessionState.IDLE
+
+    async def _execute_selected(self, command: Command) -> None:
+        self.input_area.text = "/" + command.name
+        await self.submit(self.input_area.text)
+
+    async def _handle_completion_key(self, event: events.Key) -> bool:
+        return await handle_completion_key(self, event)
+
+    def _sync_completion_from_input(self, input_text: str | None = None) -> None:
+        value = self.input_area.text if input_text is None else input_text
+        self.completion.update(value, self.cmd_registry)
+        self._render_completion()
+
+    def _render_completion(self) -> None:
+        try:
+            widget = self.query_one("#completion", Static)
+        except NoMatches:
+            return
+        widget.styles.display = "block" if self.completion.active else "none"
+        widget.update(self.completion.render(max(8, self.size.width - 2)))
+
+    def on_text_area_changed(self, event: TextArea.Changed) -> None:
+        if event.text_area.id == "input":
+            self._sync_completion_from_input(event.text_area.text)
+
     def begin_resume(self) -> None:
         begin_resume(self)
 
@@ -306,6 +478,7 @@ class LiCodeApp(App[None]):
             "#streaming",
             "#input-hint",
             "#input",
+            "#completion",
             "#statusbar",
         ):
             self.query_one(selector).styles.display = "none"
@@ -317,6 +490,7 @@ class LiCodeApp(App[None]):
         self.query_one("#resume-search", Static).styles.display = "none"
         for selector in ("#log", "#streaming", "#input-hint", "#input", "#statusbar"):
             self.query_one(selector).styles.display = "block"
+        self._render_completion()
         self.query_one("#input", MessageInput).focus()
 
     def _refresh_resume_options(self) -> None:
@@ -386,10 +560,10 @@ class LiCodeApp(App[None]):
             return
         self.query_one("#statusbar", Static).update(
             status_bar(
-                self.mode,
+                self._mode,
                 self.provider.model,
-                self.usage_in,
-                self.usage_out,
+                self._usage_in,
+                self._usage_out,
             )
         )
 
@@ -418,6 +592,11 @@ class LiCodeApp(App[None]):
         if self.state is SessionState.RESUMING:
             self._cancel_resume()
             return
+        if self.state is SessionState.IDLE and self.completion.active:
+            self.completion.hide()
+            self._render_completion()
+            self.input_area.focus()
+            return
         if self.state in {SessionState.STREAMING, SessionState.APPROVING}:
             self._deny_pending()
         if self.state in {SessionState.STREAMING, SessionState.APPROVING} and self.turn_cancel:
@@ -426,15 +605,17 @@ class LiCodeApp(App[None]):
     def action_cycle_mode(self) -> None:
         if self.state is not SessionState.IDLE:
             return
-        self.mode = next_mode(self.mode)
-        rendered = notice_block(f"已切换到 {self.mode} 模式")
+        self._mode = next_mode(self._mode)
+        rendered = notice_block(f"已切换到 {self._mode} 模式")
         self.query_one("#log", RichLog).write(rendered)
         self._transcript.append(rendered)
         self._update_status_bar()
 
-    def on_key(self, event: events.Key) -> None:
+    async def on_key(self, event: events.Key) -> None:
         if self.state is SessionState.RESUMING:
             handle_resume_key(self, event)
+            return
+        if self.state is SessionState.IDLE and await self._handle_completion_key(event):
             return
         if self.state is not SessionState.APPROVING:
             return
