@@ -30,6 +30,7 @@ class McpTool:
     _parameters: dict[str, Any]
     read_only: bool
     caller: CallerSession
+    is_system = False
 
     def name(self) -> str:
         return self.full_name

@@ -27,6 +27,9 @@ class Tool(Protocol):
     @property
     def read_only(self) -> bool: ...
 
+    @property
+    def is_system(self) -> bool: ...
+
     async def execute(self, args: str) -> Result: ...
 
 
@@ -76,5 +79,19 @@ __all__ = [
     "Registry",
     "Result",
     "Tool",
+    "InstallSkillTool",
+    "LoadSkillTool",
     "new_default_registry",
 ]
+
+
+def __getattr__(name: str) -> object:
+    if name == "LoadSkillTool":
+        from .load_skill import LoadSkillTool
+
+        return LoadSkillTool
+    if name == "InstallSkillTool":
+        from .install_skill import InstallSkillTool
+
+        return InstallSkillTool
+    raise AttributeError(name)

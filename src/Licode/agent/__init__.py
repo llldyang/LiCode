@@ -1,5 +1,7 @@
 """ReAct Agent 循环编排。"""
 
+from __future__ import annotations
+
 import asyncio
 import json
 import logging
@@ -7,7 +9,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from Licode import prompt
 from Licode.compact import (
@@ -36,12 +38,17 @@ from Licode.llm import (
 from Licode.llm import Usage as LLMUsage
 from Licode.memory import Manager as MemoryManager
 from Licode.permission import Decision, Engine, Mode, Outcome
+from Licode.skills.active import bind_active_skills, reset_active_skills
+from Licode.skills.adapter import to_prompt_entries
 from Licode.tool import DEFAULT_TIMEOUT, Registry, Result
 
 from .event import CompactEvent, CompactPhase, Event, Phase, ToolEvent, Usage
 from .runtime import SessionRuntime
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from Licode.skills import Catalog
 
 MAX_ITERATIONS: int = 25
 MAX_UNKNOWN_RUN: int = 3
@@ -96,14 +103,32 @@ class Agent:
         self._memory_manager = memory_manager
         self._instruction_text = instruction_text
         self._memory_text = memory_text
+        self._catalog: Catalog | None = None
         self._run_lock = asyncio.Lock()
+
+    def with_catalog(self, catalog: Catalog) -> Agent:
+        self._catalog = catalog
+        return self
+
+    def activate_skill(self, name: str, prompt_body: str) -> None:
+        self.runtime.active_skills.activate(name, prompt_body)
+
+    def clear_active_skills(self) -> None:
+        self.runtime.active_skills.clear()
+
+    def list_active_skills(self) -> list[str]:
+        return self.runtime.active_skills.names()
 
     async def run(
         self, conv: Conversation, mode: Mode, cancel: asyncio.Event
     ) -> AsyncIterator[AgentOutput]:
-        async with self._run_lock:
-            async for output in self._run_locked(conv, mode, cancel):
-                yield output
+        active_token = bind_active_skills(self.runtime.active_skills)
+        try:
+            async with self._run_lock:
+                async for output in self._run_locked(conv, mode, cancel):
+                    yield output
+        finally:
+            reset_active_skills(active_token)
 
     async def _run_locked(
         self, conv: Conversation, mode: Mode, cancel: asyncio.Event
@@ -116,8 +141,17 @@ class Agent:
             if self._memory_manager is not None
             else self._memory_text
         )
-        stable_system = prompt.build_system_prompt(self._instruction_text, memory_text)
-        environment_text = environment.render()
+        skills_catalog = (
+            prompt.render_skills_catalog(self._catalog.to_prompt_items())
+            if self._catalog is not None
+            else ""
+        )
+        stable_system = prompt.build_system_prompt(
+            self._instruction_text,
+            memory_text,
+            skills_catalog,
+        )
+        base_environment = environment.render()
 
         unknown_run = 0
         for iteration in range(1, MAX_ITERATIONS + 1):
@@ -130,6 +164,13 @@ class Agent:
                 definitions = self._registry.read_only_definitions()
             else:
                 definitions = self._registry.definitions()
+
+            active_block = prompt.render_active_skills_block(
+                to_prompt_entries(self.runtime.active_skills)
+            )
+            environment_text = (
+                f"{base_environment}\n\n{active_block}" if active_block else base_environment
+            )
 
             manage_input = await self._manage_input(conv, definitions, TriggerKind.AUTO)
             auto_threshold = manage_input.context_window - SUMMARY_RESERVE - AUTO_SAFETY_MARGIN

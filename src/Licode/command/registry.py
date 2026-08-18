@@ -1,5 +1,7 @@
 """斜杠命令注册中心。"""
 
+from collections.abc import Callable
+
 from .command import Command
 
 
@@ -35,3 +37,12 @@ class Registry:
     def prefix_match(self, prefix: str) -> list[Command]:
         normalized = prefix.lstrip("/").lower()
         return [cmd for cmd in self._visible if cmd.name.startswith(normalized)]
+
+    def remove_all(self, predicate: Callable[[Command], bool]) -> None:
+        removed = {id(command) for command in self._visible if predicate(command)}
+        if not removed:
+            return
+        self._visible = [command for command in self._visible if id(command) not in removed]
+        self._by_name = {
+            key: command for key, command in self._by_name.items() if id(command) not in removed
+        }

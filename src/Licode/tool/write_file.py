@@ -9,6 +9,7 @@ from . import Result
 
 class WriteFileTool:
     read_only = False
+    is_system = False
 
     def name(self) -> str:
         return "write_file"

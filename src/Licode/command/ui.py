@@ -3,6 +3,7 @@
 from typing import Protocol
 
 from Licode.permission import Mode
+from Licode.skills import SkillSummary
 
 
 class UI(Protocol):
@@ -41,6 +42,14 @@ class UI(Protocol):
     def clear_and_new_session(self) -> None: ...
 
     def idle(self) -> bool: ...
+
+    def list_catalog_skills(self) -> list[SkillSummary]: ...
+
+    def list_active_skills(self) -> list[str]: ...
+
+    def clear_active_skills(self) -> None: ...
+
+    def append_assistant_message(self, text: str) -> None: ...
 
 
 class NopUI:
@@ -99,3 +108,15 @@ class NopUI:
 
     def idle(self) -> bool:
         return True
+
+    def list_catalog_skills(self) -> list[SkillSummary]:
+        return []
+
+    def list_active_skills(self) -> list[str]:
+        return []
+
+    def clear_active_skills(self) -> None:
+        return None
+
+    def append_assistant_message(self, text: str) -> None:
+        del text

@@ -8,13 +8,14 @@ from .builtin_local import (
     make_help_handler,
 )
 from .builtin_prompt import handle_do, handle_review
+from .builtin_skill import handle_skill
 from .builtin_ui import handle_clear, handle_compact, handle_exit, handle_plan, handle_resume
 from .command import Command, Kind
 from .registry import Registry
 
 
 def register_builtins(registry: Registry) -> None:
-    """一次性注册全部 12 条内置命令。"""
+    """一次性注册全部 13 条内置命令。"""
 
     commands = (
         Command("clear", "清空当前对话并开启新会话", Kind.UI, handle_clear),
@@ -28,6 +29,7 @@ def register_builtins(registry: Registry) -> None:
         Command("resume", "恢复历史会话", Kind.UI, handle_resume),
         Command("review", "请求 AI 审查当前代码", Kind.PROMPT, handle_review),
         Command("session", "显示当前会话信息", Kind.LOCAL, handle_session),
+        Command("skill", "列出已加载的 Skill", Kind.LOCAL, handle_skill),
         Command("status", "显示 LiCode 运行状态", Kind.LOCAL, handle_status),
     )
     for command in commands:

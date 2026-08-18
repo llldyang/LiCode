@@ -27,6 +27,9 @@ class Registry:
     def count(self) -> int:
         return len(self._tools)
 
+    def items(self) -> list[tuple[str, Tool]]:
+        return [(name, self._tools[name]) for name in self._order]
+
     def definitions(self) -> list[ToolDefinition]:
         return [self._definition(name) for name in self._order]
 
@@ -34,6 +37,23 @@ class Registry:
         """只导出只读工具定义，并保持注册顺序。"""
 
         return [self._definition(name) for name in self._order if self._tools[name].read_only]
+
+    def system_definitions(self) -> list[ToolDefinition]:
+        return [
+            self._definition(name)
+            for name in self._order
+            if getattr(self._tools[name], "is_system", False)
+        ]
+
+    def definitions_filtered(self, allowed: list[str]) -> list[ToolDefinition]:
+        if not allowed:
+            return self.definitions()
+        names = set(allowed)
+        return [
+            self._definition(name)
+            for name in self._order
+            if name in names or getattr(self._tools[name], "is_system", False)
+        ]
 
     def is_read_only(self, name: str) -> bool:
         tool = self.get(name)

@@ -14,6 +14,7 @@ MAX_LINE_LENGTH = 1024 * 1024
 
 class GrepTool:
     read_only = True
+    is_system = False
 
     def name(self) -> str:
         return "grep"

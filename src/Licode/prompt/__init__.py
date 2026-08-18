@@ -3,6 +3,12 @@
 from .environment import Environment, gather_environment
 from .modules import Module, fixed_modules, optional_modules
 from .reminder import EXECUTE_DIRECTIVE, plan_reminder, system_reminder
+from .skills_block import (
+    ActiveSkillEntry,
+    SkillCatalogItem,
+    render_active_skills_block,
+    render_skills_catalog,
+)
 
 CAT_BANNER = r""" /\_/\\
 ( o.o )
@@ -17,10 +23,10 @@ def assemble_system(modules: list[Module]) -> str:
     return "\n\n".join(module.content for module in ordered if module.content)
 
 
-def build_system_prompt(instructions: str = "", memory: str = "") -> str:
+def build_system_prompt(instructions: str = "", memory: str = "", skills_catalog: str = "") -> str:
     """构造跨轮逐字节稳定的系统提示。"""
 
-    return assemble_system(fixed_modules() + optional_modules(instructions, memory))
+    return assemble_system(fixed_modules() + optional_modules(instructions, memory, skills_catalog))
 
 
 def render_banner(version: str, cwd: str) -> str:
@@ -33,8 +39,10 @@ __all__ = [
     "CAT_BANNER",
     "EXECUTE_DIRECTIVE",
     "READY_HINT",
+    "ActiveSkillEntry",
     "Environment",
     "Module",
+    "SkillCatalogItem",
     "assemble_system",
     "build_system_prompt",
     "fixed_modules",
@@ -42,5 +50,7 @@ __all__ = [
     "optional_modules",
     "plan_reminder",
     "render_banner",
+    "render_active_skills_block",
+    "render_skills_catalog",
     "system_reminder",
 ]

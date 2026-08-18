@@ -2,6 +2,8 @@
 
 from dataclasses import dataclass
 
+PRIO_SKILLS_CATALOG = 90
+
 
 @dataclass(frozen=True)
 class Module:
@@ -64,11 +66,13 @@ def fixed_modules() -> list[Module]:
     ]
 
 
-def optional_modules(instructions: str = "", memory: str = "") -> list[Module]:
+def optional_modules(
+    instructions: str = "", memory: str = "", skills_catalog: str = ""
+) -> list[Module]:
     """返回由当前项目上下文填充的可选模块。"""
 
     return [
         Module("custom-instructions", 80, instructions),
-        Module("已激活 Skill", 90, ""),
+        Module("skills-catalog", PRIO_SKILLS_CATALOG, skills_catalog),
         Module("long-term-memory", 100, memory),
     ]

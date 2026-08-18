@@ -9,6 +9,7 @@ from . import Result
 
 class EditFileTool:
     read_only = False
+    is_system = False
 
     def name(self) -> str:
         return "edit_file"

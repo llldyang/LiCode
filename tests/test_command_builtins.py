@@ -54,6 +54,7 @@ def test_register_builtins_all_registered() -> None:
         "resume",
         "review",
         "session",
+        "skill",
         "status",
     ]
 
@@ -102,7 +103,7 @@ async def test_handle_do_sets_mode_and_injects() -> None:
     assert "开始执行" in ui.injections[0][1]
 
 
-async def test_help_prints_twelve_sorted_commands() -> None:
+async def test_help_prints_thirteen_sorted_commands() -> None:
     ui = RecordingUI()
     command = builtins().lookup("help")
     assert command is not None
@@ -110,5 +111,5 @@ async def test_help_prints_twelve_sorted_commands() -> None:
     await command.handler(ui)
 
     lines = ui.printed[0].splitlines()
-    assert len(lines) == 12
+    assert len(lines) == 13
     assert [line.split()[0] for line in lines] == [f"/{item.name}" for item in builtins().visible()]

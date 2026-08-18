@@ -5,7 +5,9 @@ from Licode.config import ProviderConfig
 from Licode.memory import Manager as MemoryManager
 from Licode.permission import Engine
 from Licode.session import Writer
+from Licode.skills import Catalog
 from Licode.tool import Registry
+from Licode.tool.install_skill import InstallSkillTool
 
 from .app import LiCodeApp, SessionState
 
@@ -21,6 +23,8 @@ def new_app(
     instruction_text: str = "",
     memory_text: str = "",
     sessions_dir: str | None = None,
+    catalog: Catalog | None = None,
+    install_skill_tool: InstallSkillTool | None = None,
 ) -> LiCodeApp:
     return LiCodeApp(
         providers,
@@ -33,6 +37,8 @@ def new_app(
         instruction_text,
         memory_text,
         sessions_dir,
+        catalog,
+        install_skill_tool,
     )
 
 

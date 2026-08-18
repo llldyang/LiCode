@@ -24,7 +24,12 @@ from Licode.agent import (
     SessionRuntime,
     new_agent,
 )
-from Licode.command import Command, register_builtins
+from Licode.command import (
+    Command,
+    register_builtins,
+    register_skills_as_commands,
+    remove_skill_commands,
+)
 from Licode.command import Registry as CommandRegistry
 from Licode.compact import (
     CompactCircuitBreaker,
@@ -39,8 +44,11 @@ from Licode.memory import Manager as MemoryManager
 from Licode.permission import Engine, Mode, Outcome
 from Licode.prompt import render_banner
 from Licode.session import SessionInfo, Writer
+from Licode.skills import Catalog, SkillSummary
+from Licode.skills.executor import Executor
 from Licode.tool import Registry as ToolRegistry
 from Licode.tool import new_default_registry
+from Licode.tool.install_skill import InstallSkillTool
 
 from .commands import dispatch_slash
 from .complete import CompletionMenu, handle_completion_key
@@ -171,6 +179,8 @@ class LiCodeApp(App[None]):
         instruction_text: str = "",
         memory_text: str = "",
         sessions_dir: str | None = None,
+        catalog: Catalog | None = None,
+        install_skill_tool: InstallSkillTool | None = None,
     ) -> None:
         super().__init__()
         self.state = SessionState.SELECTING if len(providers) > 1 else SessionState.IDLE
@@ -196,11 +206,26 @@ class LiCodeApp(App[None]):
         self.memory_text = memory_text
         self.sessions_dir = sessions_dir or str(Path(self.runtime.session.session_dir).parent)
         self.workspace = str(Path(self.sessions_dir).resolve().parents[1])
+        self.catalog = catalog or Catalog(Path(self.workspace))
         self.agent: Agent | None = None
         self.conv = Conversation(
             writer.on_append if writer is not None else None,
             writer.on_replace if writer is not None else None,
         )
+        self.skill_executor = Executor(
+            self.catalog,
+            self.runtime.active_skills,
+            self._tool_registry,
+            self.engine,
+            self.version,
+            self.providers,
+            instruction_text=self.instruction_text,
+            memory_text=self.memory_text,
+        )
+        register_skills_as_commands(self.cmd_registry, self.catalog, self.skill_executor)
+        self._install_skill_tool = install_skill_tool
+        if self._install_skill_tool is not None:
+            self._install_skill_tool.set_on_installed(self._reload_skill_commands)
         self._mode = engine.start_mode()
         self.iter = 0
         self._usage_in = 0
@@ -267,7 +292,8 @@ class LiCodeApp(App[None]):
             memory_manager=self.memory_manager,
             instruction_text=self.instruction_text,
             memory_text=self.memory_text,
-        )
+        ).with_catalog(self.catalog)
+        self.skill_executor.bind(self.provider, self.conv)
         self.state = SessionState.IDLE
         self.query_one("#provider-select", OptionList).styles.display = "none"
         for selector in ("#log", "#streaming", "#input-hint", "#input", "#statusbar"):
@@ -429,6 +455,8 @@ class LiCodeApp(App[None]):
         self.writer = new_writer
         self.conv = Conversation(new_writer.on_append, new_writer.on_replace)
         self.runtime.reset_for_new_session(session_context)
+        if self.provider is not None:
+            self.skill_executor.bind(self.provider, self.conv)
         self.iter = 0
         self._usage_in = 0
         self._usage_out = 0
@@ -440,6 +468,26 @@ class LiCodeApp(App[None]):
 
     def idle(self) -> bool:
         return self.state is SessionState.IDLE
+
+    def list_catalog_skills(self) -> list[SkillSummary]:
+        return self.catalog.summaries()
+
+    def list_active_skills(self) -> list[str]:
+        return self.runtime.active_skills.names()
+
+    def clear_active_skills(self) -> None:
+        self.runtime.active_skills.clear()
+
+    def append_assistant_message(self, text: str) -> None:
+        self.conv.add_assistant(text)
+        rendered = assistant_block(text, 0.0)
+        self.query_one("#log", RichLog).write(rendered)
+        self._transcript.append(rendered)
+
+    def _reload_skill_commands(self) -> None:
+        remove_skill_commands(self.cmd_registry)
+        register_skills_as_commands(self.cmd_registry, self.catalog, self.skill_executor)
+        self._sync_completion_from_input()
 
     async def _execute_selected(self, command: Command) -> None:
         self.input_area.text = "/" + command.name

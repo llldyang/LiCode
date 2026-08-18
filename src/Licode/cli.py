@@ -7,7 +7,7 @@ from contextlib import suppress
 from datetime import timedelta
 from pathlib import Path
 
-from Licode import __version__, config, instructions, memory, permission, session
+from Licode import __version__, config, instructions, memory, permission, session, skills
 from Licode import mcp as mcp_client
 from Licode.agent import SessionRuntime
 from Licode.compact import (
@@ -18,6 +18,8 @@ from Licode.compact import (
 )
 from Licode.config import ConfigError
 from Licode.tool import new_default_registry
+from Licode.tool.install_skill import InstallSkillTool
+from Licode.tool.load_skill import LoadSkillTool
 from Licode.tui import new_app
 
 
@@ -62,6 +64,20 @@ async def _amain() -> int:
         manager = await mcp_client.new_manager(mcp_config, version=__version__)
         for external_tool in manager.tools():
             registry.register(external_tool)
+        catalog = skills.Catalog.load(root)
+        load_skill_tool = LoadSkillTool(catalog, runtime.active_skills)
+        install_skill_tool = InstallSkillTool(catalog, Path(root))
+        registry.register(load_skill_tool)
+        registry.register(install_skill_tool)
+        invalid_skills: set[str] = set()
+        for issue in catalog.validate_tools(registry):
+            print(
+                f"跳过 Skill {issue.skill_name}: 未注册工具 {issue.tool_name}",
+                file=sys.stderr,
+            )
+            invalid_skills.add(issue.skill_name)
+        for skill_name in invalid_skills:
+            catalog.remove(skill_name)
         engine, engine_error = permission.new_engine(root)
         if engine_error is not None:
             print(f"权限引擎降级: {engine_error}", file=sys.stderr)
@@ -76,6 +92,8 @@ async def _amain() -> int:
             instruction_text,
             memory_text,
             sessions_dir,
+            catalog,
+            install_skill_tool,
         )
         await app.run_async(inline=True, inline_no_clear=True)
         app.print_transcript()
