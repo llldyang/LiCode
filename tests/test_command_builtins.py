@@ -1,6 +1,6 @@
 import pytest
 
-from Licode.command import NopUI, Registry, WorktreeSummary, register_builtins
+from Licode.command import Kind, NopUI, Registry, WorktreeSummary, register_builtins
 from Licode.permission import Mode
 
 
@@ -95,6 +95,32 @@ def test_register_builtins_all_registered() -> None:
         "status",
         "worktree",
     ]
+
+
+def test_original_twelve_commands_keep_their_execution_kinds() -> None:
+    expected = {
+        "clear": Kind.UI,
+        "compact": Kind.UI,
+        "do": Kind.PROMPT,
+        "exit": Kind.UI,
+        "help": Kind.LOCAL,
+        "memory": Kind.LOCAL,
+        "permission": Kind.LOCAL,
+        "plan": Kind.UI,
+        "resume": Kind.UI,
+        "review": Kind.PROMPT,
+        "session": Kind.LOCAL,
+        "status": Kind.LOCAL,
+    }
+    registry = builtins()
+    actual: dict[str, Kind] = {}
+    for name in expected:
+        command = registry.lookup(name)
+        assert command is not None
+        assert not command.hidden
+        actual[name] = command.kind
+
+    assert actual == expected
 
 
 def test_register_builtins_no_collision() -> None:

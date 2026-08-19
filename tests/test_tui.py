@@ -625,6 +625,24 @@ async def test_tui_dispatch_is_case_insensitive_and_unknown_is_friendly(
 
 
 @pytest.mark.asyncio
+async def test_tui_empty_and_whitespace_submissions_are_noops(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    provider = FakeProvider([])
+    app = make_app(tmp_path, monkeypatch, provider)
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        transcript_size = len(app._transcript)
+        await app.submit("")
+        await app.submit("   \t")
+
+        assert len(app._transcript) == transcript_size
+        assert app.conv.length() == 0
+        assert provider.call_count == 0
+
+
+@pytest.mark.asyncio
 async def test_tui_local_status_session_permission_and_memory_outputs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
