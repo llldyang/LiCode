@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import sys
+from math import isfinite
 from pathlib import Path
 from typing import Any
 
@@ -63,7 +64,7 @@ def load(project_root: str | Path) -> Engine:
 def _read_file(path: Path) -> list[Any] | None:
     try:
         root = yaml.safe_load(path.read_text(encoding="utf-8"))
-    except (OSError, yaml.YAMLError) as exc:
+    except (OSError, UnicodeError, yaml.YAMLError) as exc:
         print(f"hooks file {path} load failed: {exc}", file=sys.stderr)
         return None
     if not isinstance(root, dict) or not isinstance(root.get("hooks"), list):
@@ -216,7 +217,7 @@ def _parse_duration(raw: Any) -> float:
         seconds = float(match.group(1)) * {"": 1, "s": 1, "m": 60, "h": 3600}[match.group(2)]
     else:
         raise ValueError("timeout must be a duration")
-    if seconds <= 0:
+    if not isfinite(seconds) or seconds <= 0:
         raise ValueError("timeout must be greater than zero")
     return seconds
 

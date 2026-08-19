@@ -23,6 +23,22 @@ class FakeExecutor:
         return None
 
 
+class ControlledExecutor(FakeExecutor):
+    def __init__(self) -> None:
+        super().__init__()
+        self.release = asyncio.Event()
+        self.results: asyncio.Queue[ExecutionResult | Exception] = asyncio.Queue()
+
+    async def run(self, rule: Rule, payload: dict, *, blocking: bool) -> ExecutionResult:
+        self.calls.append((rule.name, payload, blocking))
+        self.started.set()
+        await self.release.wait()
+        result = await self.results.get()
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+
 def rule(
     name: str,
     event: Event = Event.PRE_TOOL_USE,
@@ -85,3 +101,56 @@ async def test_async_rule_runs_in_background_and_logs_error(capsys) -> None:
     await engine.wait_background()
     assert fake.started.is_set()
     assert "[hook async] Stop failed: boom" in capsys.readouterr().err
+
+
+@pytest.mark.asyncio
+async def test_only_once_is_claimed_atomically_and_only_consumed_on_success(capsys) -> None:
+    fake = ControlledExecutor()
+    engine = Engine(
+        [rule("once", Event.STOP, once=True, background=True)],
+        [],
+        fake,  # type: ignore[arg-type]
+    )
+
+    await engine.dispatch(Event.STOP, {})
+    await fake.started.wait()
+    await engine.dispatch(Event.STOP, {})
+    assert len(fake.calls) == 1
+
+    await fake.results.put(RuntimeError("first failed"))
+    fake.release.set()
+    await engine.wait_background()
+    assert "[hook once] Stop failed: first failed" in capsys.readouterr().err
+
+    fake.started.clear()
+    fake.release.clear()
+    await fake.results.put(ExecutionResult())
+    await engine.dispatch(Event.STOP, {})
+    await fake.started.wait()
+    fake.release.set()
+    await engine.wait_background()
+    await engine.dispatch(Event.STOP, {})
+    assert len(fake.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_sync_executor_exception_is_logged_and_later_rule_continues(capsys) -> None:
+    class RaisingExecutor(FakeExecutor):
+        async def run(self, rule: Rule, payload: dict, *, blocking: bool) -> ExecutionResult:
+            self.calls.append((rule.name, payload, blocking))
+            if rule.name == "broken":
+                raise RuntimeError("unexpected")
+            return ExecutionResult(prompt="continued")
+
+    fake = RaisingExecutor()
+    engine = Engine(
+        [rule("broken", Event.STOP), rule("later", Event.STOP)],
+        [],
+        fake,  # type: ignore[arg-type]
+    )
+
+    result = await engine.dispatch(Event.STOP, {})
+
+    assert [call[0] for call in fake.calls] == ["broken", "later"]
+    assert result.injected_prompts == ["continued"]
+    assert "[hook broken] Stop failed: unexpected" in capsys.readouterr().err

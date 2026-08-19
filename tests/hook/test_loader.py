@@ -155,3 +155,29 @@ def test_invalid_file_is_reported_without_raising(
 
     assert engine.rules == []
     assert "load failed" in capsys.readouterr().err
+
+
+def test_invalid_utf8_and_non_finite_timeout_are_degraded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    home = tmp_path / "home"
+    project = tmp_path / "project"
+    (home / ".LiCode").mkdir(parents=True)
+    (project / ".LiCode").mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    (project / ".LiCode" / "hooks.yaml").write_bytes(b"\xff\xfe")
+    (home / ".LiCode" / "hooks.yaml").write_text(
+        "hooks:\n"
+        "  - {name: bad-timeout, event: Stop, timeout: .nan, "
+        "action: {type: prompt, text: x}}\n",
+        encoding="utf-8",
+    )
+
+    engine = load(project)
+
+    assert engine.rules == []
+    stderr = capsys.readouterr().err
+    assert "load failed" in stderr
+    assert "timeout must be greater than zero" in stderr
