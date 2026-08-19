@@ -154,21 +154,26 @@ class Manager:
         handle: asyncio.Task[str],
         aggregator: asyncio.Task[None],
     ) -> None:
+        result = ""
+        error: BaseException | None = None
         try:
-            task.result = await handle
-            task.status = Status.COMPLETED
+            result = await handle
+            status = Status.COMPLETED
         except asyncio.CancelledError:
-            task.status = Status.CANCELLED
+            status = Status.CANCELLED
         except BaseException as exc:
-            task.status = Status.FAILED
-            task.err = exc
-        finally:
-            task.end_time = time.monotonic()
-            with suppress(asyncio.QueueFull):
-                events.put_nowait(None)
-            with suppress(asyncio.CancelledError):
-                await aggregator
-            self._notify_done(task.id)
+            status = Status.FAILED
+            error = exc
+
+        # 必须可靠送达哨兵并排空事件，再公开最终状态和通知，避免续派与旧通知交错。
+        await events.put(None)
+        with suppress(asyncio.CancelledError):
+            await aggregator
+        task.result = result
+        task.err = error
+        task.status = status
+        task.end_time = time.monotonic()
+        self._notify_done(task.id)
 
     async def launch(
         self,
@@ -247,6 +252,8 @@ class Manager:
         task.status = Status.RUNNING
         task.result = ""
         task.err = None
+        task.start_time = time.monotonic()
+        task.end_time = 0.0
         events: asyncio.Queue[AgentOutput | None] = asyncio.Queue(maxsize=64)
         aggregator = asyncio.create_task(self._aggregate_task_events(events, task))
         handle = asyncio.create_task(task.sub_agent.run_to_completion(task.conv, "", events))
@@ -258,8 +265,5 @@ class Manager:
         """把子 Agent 审批请求交给 TUI，并等待用户选择。"""
 
         await self._approvals.put(request)
-        try:
-            outcome = await request.respond
-        except asyncio.CancelledError:
-            return Outcome.DENY_ONCE, False
+        outcome = await request.respond
         return outcome, True

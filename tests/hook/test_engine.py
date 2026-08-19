@@ -93,6 +93,21 @@ async def test_only_once_and_reset() -> None:
 
 
 @pytest.mark.asyncio
+async def test_only_once_is_isolated_by_session_id() -> None:
+    fake = FakeExecutor()
+    engine = Engine([rule("once", Event.STOP, once=True)], [], fake)  # type: ignore[arg-type]
+    await engine.dispatch(Event.STOP, {"session_id": "parent"})
+    await engine.dispatch(Event.STOP, {"session_id": "parent"})
+    await engine.dispatch(Event.STOP, {"session_id": "child"})
+    assert len(fake.calls) == 2
+
+    await engine.reset_for_new_session("parent")
+    await engine.dispatch(Event.STOP, {"session_id": "parent"})
+    await engine.dispatch(Event.STOP, {"session_id": "child"})
+    assert len(fake.calls) == 3
+
+
+@pytest.mark.asyncio
 async def test_async_rule_runs_in_background_and_logs_error(capsys) -> None:
     fake = FakeExecutor({"async": ExecutionResult(err=RuntimeError("boom"))})
     engine = Engine([rule("async", Event.STOP, background=True)], [], fake)  # type: ignore[arg-type]

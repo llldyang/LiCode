@@ -10,7 +10,13 @@ from rich.console import Console
 from textual.pilot import Pilot
 from textual.widgets import OptionList, Static
 
-from Licode.agent import NOTICE_CANCELLED, CompactEvent, CompactPhase, SessionRuntime
+from Licode.agent import (
+    NOTICE_CANCELLED,
+    ApprovalRequest,
+    CompactEvent,
+    CompactPhase,
+    SessionRuntime,
+)
 from Licode.command import Command, Kind, Registry, register_builtins
 from Licode.command.builtin_prompt import REVIEW_DIRECTIVE
 from Licode.compact import (
@@ -26,7 +32,7 @@ from Licode.hook.executor import ExecutionResult
 from Licode.hook.rule import Action, ActionType, PromptAction
 from Licode.hook.rule import Rule as HookRule
 from Licode.llm import PromptTooLongError, Request, StreamEvent, ToolCall, Usage
-from Licode.permission import Engine, Mode
+from Licode.permission import Engine, Mode, Outcome
 from Licode.permission.matcher import compile_matcher
 from Licode.permission.rule import Rule
 from Licode.prompt import EXECUTE_DIRECTIVE
@@ -554,6 +560,68 @@ async def test_escape_cancels_approval_and_next_turn_still_works(
         await wait_for_state(pilot, app, SessionState.IDLE)
         assert app.conv.messages()[-1].content == "取消后仍可继续"
         assert provider.call_count == 3
+
+
+@pytest.mark.asyncio
+async def test_idle_subagent_approval_restores_input_focus(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    provider = FakeProvider([])
+    app = make_app(tmp_path, monkeypatch, provider)
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        request = ApprovalRequest(
+            "Agent",
+            '{"prompt":"nested"}',
+            "需要确认",
+            asyncio.get_running_loop().create_future(),
+        )
+        approval = asyncio.create_task(app.task_mgr.upgrade_approval(request))
+
+        await wait_for_state(pilot, app, SessionState.APPROVING)
+        await pilot.press("enter")
+
+        assert await asyncio.wait_for(approval, timeout=1) == (Outcome.ALLOW_ONCE, True)
+        assert app.state is SessionState.IDLE
+        assert not app.input_area.disabled
+        assert app.input_area.has_focus
+        assert str(app.query_one("#streaming", Static).content) == ""
+
+
+@pytest.mark.asyncio
+async def test_finishing_turn_preserves_pending_subagent_approval(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    provider = ControlledProvider()
+    app = make_app(tmp_path, monkeypatch, provider)
+
+    async with app.run_test() as pilot:
+        await app.submit("主轮与后台审批并发")
+        await asyncio.wait_for(provider.started.wait(), timeout=1)
+        request = ApprovalRequest(
+            "Agent",
+            '{"prompt":"nested"}',
+            "需要确认",
+            asyncio.get_running_loop().create_future(),
+        )
+        approval = asyncio.create_task(app.task_mgr.upgrade_approval(request))
+        await wait_for_state(pilot, app, SessionState.APPROVING)
+
+        provider.release.set()
+        for _ in range(100):
+            if app.conv.messages() and app.conv.messages()[-1].role == "assistant":
+                break
+            await pilot.pause(0.01)
+
+        assert app.state is SessionState.APPROVING
+        assert app.pending is request
+        assert app.input_area.disabled
+        await pilot.press("enter")
+
+        assert await asyncio.wait_for(approval, timeout=1) == (Outcome.ALLOW_ONCE, True)
+        assert app.state is SessionState.IDLE
+        assert app.input_area.has_focus
 
 
 @pytest.mark.asyncio

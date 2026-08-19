@@ -691,6 +691,7 @@ class LiCodeApp(App[None]):
 
     def _finish_turn(self) -> float:
         elapsed = time.monotonic() - self.turn_start
+        approval_pending = self.state is SessionState.APPROVING and self.pending is not None
         if self._timer is not None:
             self._timer.stop()
         self._timer = None
@@ -698,12 +699,18 @@ class LiCodeApp(App[None]):
         self.cur_tools = []
         self.iter = 0
         self.turn_cancel = None
-        self.pending = None
         message_input = self.query_one("#input", MessageInput)
-        message_input.disabled = False
-        self.state = SessionState.IDLE
-        self.query_one("#streaming", Static).update("")
-        message_input.focus()
+        if approval_pending:
+            # 后台 Agent 可能在主轮即将结束时请求审批；保留请求，待用户响应后再回到空闲态。
+            self._approval_return_state = SessionState.IDLE
+            message_input.disabled = True
+            self._refresh_streaming_view()
+        else:
+            self.pending = None
+            message_input.disabled = False
+            self.state = SessionState.IDLE
+            self.query_one("#streaming", Static).update("")
+            message_input.focus()
         return elapsed
 
     def _finish_with_assistant(self, reply: str) -> None:
@@ -824,8 +831,12 @@ class LiCodeApp(App[None]):
         request = self.pending
         self.pending = None
         self.state = self._approval_return_state
-        # 审批结束通常仍处于模型流式阶段，输入框应由整轮结束逻辑统一恢复。
-        self.query_one("#input", MessageInput).disabled = self.state is not SessionState.IDLE
+        message_input = self.query_one("#input", MessageInput)
+        message_input.disabled = self.state is not SessionState.IDLE
+        if self.state is SessionState.IDLE:
+            # 空闲时弹出的后台审批没有后续主轮收尾，需要在这里主动恢复输入焦点。
+            self.query_one("#streaming", Static).update("")
+            message_input.focus()
         if request is not None and not request.respond.done():
             request.respond.set_result(outcome)
 

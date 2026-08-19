@@ -32,3 +32,15 @@ def test_dangling_calls_get_placeholders() -> None:
     assert all(item.is_error for item in messages[-2].tool_results)
     assert is_fork_context(messages)
     assert not is_fork_context(parent)
+
+
+def test_dangling_call_is_repaired_before_later_history() -> None:
+    parent = [
+        Message(role="assistant", tool_calls=[ToolCall("1", "a", "{}")]),
+        Message(role="user", content="later"),
+    ]
+
+    messages = build_forked_messages(parent, "next")
+
+    assert [message.role for message in messages] == ["assistant", "tool", "user", "user"]
+    assert messages[1].tool_results[0].tool_call_id == "1"

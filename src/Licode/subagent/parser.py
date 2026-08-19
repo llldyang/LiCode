@@ -57,14 +57,16 @@ def parse_definition(data: bytes, file_path: str, source: Source) -> Definition:
     """把单个角色文件解析为 Definition。"""
 
     frontmatter, body = parse_frontmatter_and_body(data)
-    name = str(frontmatter.get("name", "")).strip()
-    description = str(frontmatter.get("description", "")).strip()
-    if not name:
+    name_raw = frontmatter.get("name")
+    description_raw = frontmatter.get("description")
+    if not isinstance(name_raw, str) or not name_raw.strip():
         raise ValueError("frontmatter 缺少非空字段: name")
+    name = name_raw.strip()
     if AGENT_NAME_REGEX.fullmatch(name) is None:
         raise ValueError(f"无效的 Agent 名称: {name}")
-    if not description:
+    if not isinstance(description_raw, str) or not description_raw.strip():
         raise ValueError("frontmatter 缺少非空字段: description")
+    description = description_raw.strip()
 
     model = str(frontmatter.get("model") or "inherit").strip()
     if model not in VALID_MODELS:
@@ -87,15 +89,16 @@ def parse_definition(data: bytes, file_path: str, source: Source) -> Definition:
             )
             permission_mode = Mode.DEFAULT
 
-    max_turns_raw = frontmatter.get("maxTurns") or 0
-    if isinstance(max_turns_raw, bool):
+    max_turns_raw = frontmatter.get("maxTurns", 0)
+    if not isinstance(max_turns_raw, int) or isinstance(max_turns_raw, bool):
         raise ValueError("maxTurns 必须是整数")
-    try:
-        max_turns = int(max_turns_raw)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("maxTurns 必须是整数") from exc
+    max_turns = max_turns_raw
     if max_turns < 0:
         raise ValueError("maxTurns 不能小于 0")
+
+    background_raw = frontmatter.get("background", False)
+    if not isinstance(background_raw, bool):
+        raise ValueError("background 必须是布尔值")
 
     isolation = str(frontmatter.get("isolation") or "").strip()
     if isolation not in VALID_ISOLATIONS:
@@ -114,7 +117,7 @@ def parse_definition(data: bytes, file_path: str, source: Source) -> Definition:
         max_turns=max_turns,
         permission_mode=permission_mode,
         dont_ask=dont_ask,
-        background=bool(frontmatter.get("background") or False),
+        background=background_raw,
         isolation=isolation,
         system_prompt=body,
         file_path=file_path,

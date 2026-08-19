@@ -36,6 +36,20 @@ class StubAgent:
         return "stub-result"
 
 
+class CancelProbeAgent:
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.cleaned = asyncio.Event()
+
+    async def run_to_completion(self, conv, task, events=None):
+        del conv, task, events
+        self.started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            self.cleaned.set()
+
+
 def make_tool(tmp_path, *, bg_enabled=True):
     parent = agent_for(tmp_path, FakeProvider([[StreamEvent(text="unused")]]))
     return AgentTool(MockCatalog(), Manager(), parent, bg_enabled), parent
@@ -55,6 +69,21 @@ async def test_basic_and_missing_prompt(tmp_path) -> None:
     }
     result = await tool.execute('{"description":"x"}')
     assert result.is_error and "prompt is required" in result.content
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"prompt": 1, "description": "x"},
+        {"prompt": "x", "description": "x", "run_in_background": "yes"},
+        {"prompt": "x", "description": "x", "extra": True},
+    ],
+)
+async def test_schema_types_are_enforced(tmp_path, payload) -> None:
+    tool, _ = make_tool(tmp_path)
+    result = await tool.execute(json.dumps(payload))
+    assert result.is_error
 
 
 @pytest.mark.asyncio
@@ -128,3 +157,26 @@ async def test_background_disabled_rejects_fork(tmp_path) -> None:
     tool, _ = make_tool(tmp_path, bg_enabled=False)
     result = await tool.execute(json.dumps({"prompt": "x", "description": "x"}))
     assert result.is_error and "background mode is disabled" in result.content
+
+
+def test_child_inherits_parent_context_window(tmp_path) -> None:
+    tool, parent = make_tool(tmp_path)
+    parent.runtime.context_window = 98765
+    child = tool._new_sub_agent(tool.catalog.resolve("worker"), [])
+    assert child.runtime.context_window == 98765
+
+
+@pytest.mark.asyncio
+async def test_foreground_cancellation_waits_for_child_cleanup(tmp_path, monkeypatch) -> None:
+    tool, _ = make_tool(tmp_path)
+    probe = CancelProbeAgent()
+    monkeypatch.setattr(tool, "_new_sub_agent", lambda definition, allowed: probe)
+    running = asyncio.create_task(
+        tool.execute(json.dumps({"prompt": "x", "description": "x", "subagent_type": "worker"}))
+    )
+    await probe.started.wait()
+
+    running.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await running
+    assert probe.cleaned.is_set()

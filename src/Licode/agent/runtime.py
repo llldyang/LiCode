@@ -48,6 +48,7 @@ class SessionRuntime:
     async def reset_for_new_session(self, session: SessionContext) -> None:
         """保留模型窗口配置，并重置所有会话级状态。"""
 
+        previous_session_id = self.session.session_id
         self.replacement = ContentReplacementState()
         self.recovery = RecoveryState()
         self.auto_tracking = CompactCircuitBreaker()
@@ -59,4 +60,4 @@ class SessionRuntime:
         with self._reminder_lock:
             self.pending_reminders.clear()
         if self.hook_engine is not None:
-            await self.hook_engine.reset_for_new_session()
+            await self.hook_engine.reset_for_new_session(previous_session_id)

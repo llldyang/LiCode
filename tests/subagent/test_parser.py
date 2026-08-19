@@ -47,6 +47,25 @@ def test_invalid_required_frontmatter(raw: bytes) -> None:
         parse_definition(raw, "bad.md", Source.USER)
 
 
+@pytest.mark.parametrize(
+    "extra",
+    [
+        "maxTurns: 1.5\n",
+        "maxTurns: '7'\n",
+        "background: 'yes'\n",
+    ],
+)
+def test_invalid_field_types_are_rejected(extra: str) -> None:
+    with pytest.raises(ValueError):
+        parse_definition(definition_bytes(extra), "bad.md", Source.USER)
+
+
+def test_description_must_be_a_string() -> None:
+    raw = b"---\nname: Tester\ndescription: 123\n---\nbody"
+    with pytest.raises(ValueError):
+        parse_definition(raw, "bad.md", Source.USER)
+
+
 def test_invalid_fields_fallback(capsys: pytest.CaptureFixture[str]) -> None:
     definition = parse_definition(
         definition_bytes("model: gpt-4\npermissionMode: strange\nisolation: container\n"),

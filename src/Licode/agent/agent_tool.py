@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -130,13 +131,31 @@ class AgentTool:
             raise ValueError(f"参数不是有效 JSON: {exc}") from exc
         if not isinstance(value, dict):
             raise ValueError("参数必须是 JSON 对象")
+        known = {
+            "prompt",
+            "description",
+            "subagent_type",
+            "model",
+            "run_in_background",
+            "name",
+        }
+        unknown = sorted(set(value) - known)
+        if unknown:
+            raise ValueError(f"未知参数: {', '.join(unknown)}")
+        for field_name in ("prompt", "description", "subagent_type", "model", "name"):
+            field_value = value.get(field_name, "")
+            if not isinstance(field_value, str):
+                raise ValueError(f"{field_name} 必须是字符串")
+        background = value.get("run_in_background", False)
+        if not isinstance(background, bool):
+            raise ValueError("run_in_background 必须是布尔值")
         return AgentArgs(
-            prompt=str(value.get("prompt") or "").strip(),
-            description=str(value.get("description") or "").strip(),
-            subagent_type=str(value.get("subagent_type") or "").strip(),
-            model=str(value.get("model") or "").strip(),
-            run_in_background=bool(value.get("run_in_background") or False),
-            name=str(value.get("name") or "").strip(),
+            prompt=value.get("prompt", "").strip(),
+            description=value.get("description", "").strip(),
+            subagent_type=value.get("subagent_type", "").strip(),
+            model=value.get("model", "").strip(),
+            run_in_background=background,
+            name=value.get("name", "").strip(),
         )
 
     def _allowed_tools(self, definition: Definition, background: bool) -> list[str]:
@@ -164,7 +183,7 @@ class AgentTool:
             recovery=RecoveryState(),
             auto_tracking=CompactCircuitBreaker(),
             session=new_session_context(self.parent.engine.root),
-            context_window=200000,
+            context_window=self.parent.runtime.context_window,
         )
         return Agent(
             self.parent.provider,
@@ -288,6 +307,8 @@ class AgentTool:
             return Result(json.dumps({"task_id": task_id, "status": "timed_out_to_background"}))
         except asyncio.CancelledError:
             handle.cancel()
+            with suppress(asyncio.CancelledError):
+                await handle
             raise
         except Exception as exc:
             return Result(f"subagent error: {exc}", is_error=True)
