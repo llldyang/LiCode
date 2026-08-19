@@ -231,7 +231,7 @@ class AgentTool:
 
         isolated = definition.isolation == "worktree"
         if isolated and self.worktree_mgr is None:
-            return Result("worktree manager not configured", is_error=True)
+            return Result("Worktree 管理器未配置", is_error=True)
         background = (
             definition.background or parsed.run_in_background or definition.is_fork()
         ) and not isolated

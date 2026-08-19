@@ -1,3 +1,4 @@
+import asyncio
 import json
 from datetime import datetime
 from pathlib import Path
@@ -9,7 +10,7 @@ from Licode.agent.agent_worktree import build_worktree_notice, execute_with_work
 from Licode.llm import StreamEvent
 from Licode.subagent import Catalog, Definition
 from Licode.task import Manager as TaskManager
-from Licode.tool import cwd_from_ctx
+from Licode.tool import cwd_from_ctx, with_cwd
 from Licode.worktree import AutoCleanupReport, Worktree
 
 from .test_run_to_completion import FakeProvider, agent_for
@@ -51,6 +52,21 @@ class StubAgent:
         return "完成"
 
 
+class FailingAgent:
+    def __init__(self, error: BaseException) -> None:
+        self.error = error
+
+    async def run_to_completion(self, conv, task, events) -> str:
+        del conv, task, events
+        raise self.error
+
+
+class FailingCleanupManager(StubManager):
+    async def auto_cleanup(self, name: str) -> AutoCleanupReport:
+        self.cleaned.append(name)
+        raise RuntimeError("cleanup failed")
+
+
 class IsolationCatalog:
     def __init__(self, *, background: bool = False) -> None:
         self.definition = Definition(
@@ -82,17 +98,21 @@ def test_build_worktree_notice() -> None:
 async def test_execute_with_worktree_injects_cwd_and_cleans(tmp_path: Path) -> None:
     manager = StubManager(tmp_path, kept=False)
     agent = StubAgent()
-    result = await execute_with_worktree(
-        manager,  # type: ignore[arg-type]
-        Definition("worker", "测试", isolation="worktree"),
-        agent,  # type: ignore[arg-type]
-        object(),  # type: ignore[arg-type]
-        "执行任务",
-        object(),  # type: ignore[arg-type]
-    )
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    with with_cwd(str(parent)):
+        result = await execute_with_worktree(
+            manager,  # type: ignore[arg-type]
+            Definition("worker", "测试", isolation="worktree"),
+            agent,  # type: ignore[arg-type]
+            object(),  # type: ignore[arg-type]
+            "执行任务",
+            object(),  # type: ignore[arg-type]
+        )
     assert result == "完成"
     assert agent.cwd == str(tmp_path)
     assert "执行任务" in agent.task
+    assert str(parent) in agent.task
     assert manager.created[0][1:] == ("HEAD", False)
     assert manager.cleaned == [manager.created[0][0]]
 
@@ -113,6 +133,39 @@ async def test_execute_with_worktree_reports_kept_copy(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("error", [RuntimeError("任务失败"), asyncio.CancelledError()])
+async def test_execute_with_worktree_cleans_after_error(
+    tmp_path: Path, error: BaseException
+) -> None:
+    manager = StubManager(tmp_path, kept=False)
+    with pytest.raises(type(error), match="任务失败" if isinstance(error, RuntimeError) else None):
+        await execute_with_worktree(
+            manager,  # type: ignore[arg-type]
+            Definition("worker", "测试", isolation="worktree"),
+            FailingAgent(error),  # type: ignore[arg-type]
+            object(),  # type: ignore[arg-type]
+            "执行任务",
+            object(),  # type: ignore[arg-type]
+        )
+    assert manager.cleaned
+
+
+@pytest.mark.asyncio
+async def test_cleanup_failure_preserves_original_error(tmp_path: Path, capsys) -> None:
+    manager = FailingCleanupManager(tmp_path, kept=False)
+    with pytest.raises(RuntimeError, match="任务失败"):
+        await execute_with_worktree(
+            manager,  # type: ignore[arg-type]
+            Definition("worker", "测试", isolation="worktree"),
+            FailingAgent(RuntimeError("任务失败")),  # type: ignore[arg-type]
+            object(),  # type: ignore[arg-type]
+            "执行任务",
+            object(),  # type: ignore[arg-type]
+        )
+    assert "自动清理失败" in capsys.readouterr().err
+
+
+@pytest.mark.asyncio
 async def test_agent_tool_rejects_missing_worktree_manager(tmp_path: Path) -> None:
     parent = agent_for(tmp_path, FakeProvider([[StreamEvent(text="unused")]]))
     tool = AgentTool(IsolationCatalog(), TaskManager(), parent, True)
@@ -120,7 +173,7 @@ async def test_agent_tool_rejects_missing_worktree_manager(tmp_path: Path) -> No
         json.dumps({"prompt": "任务", "description": "测试", "subagent_type": "worker"})
     )
     assert result.is_error
-    assert result.content == "worktree manager not configured"
+    assert result.content == "Worktree 管理器未配置"
 
 
 @pytest.mark.asyncio

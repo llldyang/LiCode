@@ -11,7 +11,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from .git import _resolve_head_sha_from_fs, _run_git
+from .git import _resolve_head_sha_from_fs, _resolve_initial_head_sha_from_fs, _run_git
 from .manager import Worktree
 from .slug import flat_slug, validate_slug
 
@@ -48,7 +48,9 @@ async def setup_git_hooks(repo_root: Path, wt_path: Path) -> None:
             resolved = candidate.resolve() if candidate.is_absolute() else repo_root / candidate
             hooks_path = str(resolved.resolve())
     if hooks_path:
-        await _run_git(wt_path, "config", "core.hooksPath", hooks_path)
+        # 普通 git config 会修改共享配置；启用 worktreeConfig 后只写当前副本。
+        await _run_git(repo_root, "config", "extensions.worktreeConfig", "true")
+        await _run_git(wt_path, "config", "--worktree", "core.hooksPath", hooks_path)
 
 
 def symlink_large_dirs(repo_root: Path, wt_path: Path, directories: list[str]) -> None:
@@ -116,10 +118,10 @@ async def _perform_post_creation_setup(
     symlink_dirs: list[str],
 ) -> None:
     steps: tuple[tuple[str, Callable[[], object | Awaitable[object]]], ...] = (
-        ("local-config", lambda: copy_local_configs(repo_root, wt_path)),
-        ("git-hooks", lambda: setup_git_hooks(repo_root, wt_path)),
-        ("symlink", lambda: symlink_large_dirs(repo_root, wt_path, symlink_dirs)),
-        ("include-ignored", lambda: copy_included_ignored(repo_root, wt_path)),
+        ("本地配置", lambda: copy_local_configs(repo_root, wt_path)),
+        ("Git hooks", lambda: setup_git_hooks(repo_root, wt_path)),
+        ("软链", lambda: symlink_large_dirs(repo_root, wt_path, symlink_dirs)),
+        ("ignored 文件", lambda: copy_included_ignored(repo_root, wt_path)),
     )
     for name, operation in steps:
         try:
@@ -138,7 +140,7 @@ async def create_worktree(
 ) -> Worktree:
     validate_slug(name)
     async with manager.lock:
-        if name in manager.active or name in manager._pending_names:
+        if name in manager.active or name in manager._pending_names or name in manager._busy_names:
             raise ValueError(f"Worktree 已存在: {name}")
         manager._pending_names.add(name)
 
@@ -150,12 +152,14 @@ async def create_worktree(
             head_sha = _resolve_head_sha_from_fs(wt_path)
             if not head_sha:
                 raise ValueError(f"已有目录不是有效 Worktree: {wt_path}")
+            initial_sha = _resolve_initial_head_sha_from_fs(wt_path)
             worktree = Worktree(
                 name=name,
                 path=str(wt_path.resolve()),
                 branch=branch,
-                based_on=base_ref,
-                head_commit=head_sha,
+                based_on=initial_sha or head_sha,
+                # 缺少 reflog 时不能证明目录没有创建后新增的提交，保守地禁止自动删除。
+                head_commit=initial_sha or "",
                 created=datetime.fromtimestamp(wt_path.stat().st_mtime),
                 manual=manual,
             )

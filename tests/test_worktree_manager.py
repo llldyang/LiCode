@@ -62,6 +62,40 @@ def test_session_round_trip_and_null(tmp_path: Path) -> None:
     assert load_session(path) is None
 
 
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "[]",
+        '{"original_cwd": 1}',
+        json.dumps(
+            {
+                "original_cwd": "root",
+                "worktree_path": "wt",
+                "worktree_name": "alice",
+                "original_branch": "main",
+                "original_head_commit": "abc",
+                "session_id": "id",
+                "hook_based": "false",
+            }
+        ),
+        json.dumps(
+            {
+                "original_cwd": "root",
+                "worktree_path": "wt",
+                "worktree_name": "alice",
+                "original_branch": "main",
+                "original_head_commit": "abc",
+                "session_id": "id",
+                "extra": True,
+            }
+        ),
+    ],
+)
+def test_session_rejects_invalid_shape_and_types(raw: str) -> None:
+    with pytest.raises(ValueError):
+        WorktreeSession.from_json(raw)
+
+
 def test_atomic_save_failure_preserves_existing_file(tmp_path: Path, monkeypatch) -> None:
     path = tmp_path / "worktree_session.json"
     path.write_text("old", encoding="utf-8")
@@ -82,4 +116,23 @@ def test_manager_loads_and_clears_stale_session(tmp_path: Path, capsys) -> None:
     manager = Manager(str(repo))
     assert manager.current_session() is None
     assert session_path.read_text(encoding="utf-8") == "null"
-    assert "session worktree gone" in capsys.readouterr().err
+    assert "session 对应的 Worktree 已丢失" in capsys.readouterr().err
+
+
+def test_invalid_session_cleanup_failure_does_not_block_startup(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    repo = tmp_path / "repo"
+    init_repo(repo)
+    session_path = repo / ".Licode" / "worktree_session.json"
+    session_path.parent.mkdir(parents=True)
+    session_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(
+        "Licode.worktree.manager.clear_session",
+        lambda _path: (_ for _ in ()).throw(OSError("只读")),
+    )
+
+    manager = Manager(str(repo))
+
+    assert manager.current_session() is None
+    assert "session 清理失败" in capsys.readouterr().err

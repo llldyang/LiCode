@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 from pathlib import Path
+
+_OBJECT_ID = re.compile(r"^[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?$")
 
 
 async def _run_git(work_dir: str | Path, *args: str) -> str:
@@ -106,3 +109,26 @@ def _resolve_head_sha_from_fs(wt_path: str | Path) -> str | None:
         if value:
             return value
     return _read_packed_ref(common_dir, ref_name)
+
+
+def _resolve_initial_head_sha_from_fs(wt_path: str | Path) -> str | None:
+    """从 Worktree HEAD reflog 恢复创建时的提交，不启动 Git 子进程。"""
+
+    git_dir = _git_dir_from_worktree(wt_path)
+    if git_dir is None:
+        return None
+    try:
+        lines = (
+            (git_dir / "logs" / "HEAD").read_text(encoding="utf-8", errors="replace").splitlines()
+        )
+    except OSError:
+        return None
+    for line in lines:
+        fields = line.split(maxsplit=2)
+        if len(fields) < 2:
+            continue
+        previous, current = fields[:2]
+        # Worktree 创建记录从全零对象指向基线提交，后续记录才是用户新增提交。
+        if set(previous) == {"0"} and _OBJECT_ID.fullmatch(current):
+            return current.lower()
+    return None

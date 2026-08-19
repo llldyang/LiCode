@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from Licode.tool import with_cwd
+from Licode.tool import cwd_from_ctx, with_cwd
 from Licode.worktree import Manager, random_agent_name
 
 if TYPE_CHECKING:
@@ -43,16 +44,27 @@ async def execute_with_worktree(
     del definition
     name = random_agent_name()
     worktree = await manager.create(name, "HEAD", manual=False)
-    parent_cwd = str(Path.cwd())
+    parent_cwd = cwd_from_ctx() or str(Path.cwd())
     notice = build_worktree_notice(parent_cwd, worktree.path)
     task_text = f"{notice}\n\n{prompt}"
     try:
         with with_cwd(worktree.path):
             final_text = await sub_agent.run_to_completion(sub_conv, task_text, events)
     except BaseException:
-        await manager.auto_cleanup(name)
+        try:
+            await manager.auto_cleanup(name)
+        except Exception as cleanup_error:
+            # 清理失败时保留原始任务异常，避免把真正的失败原因覆盖掉。
+            print(
+                f"worktree: 自动清理失败，已保留 {worktree.path}: {cleanup_error}", file=sys.stderr
+            )
         raise
-    report = await manager.auto_cleanup(name)
+    try:
+        report = await manager.auto_cleanup(name)
+    except Exception as cleanup_error:
+        print(f"worktree: 自动清理失败，已保留 {worktree.path}: {cleanup_error}", file=sys.stderr)
+        final_text += f"\n[Worktree 清理失败，已保留在 {worktree.path}，分支 {worktree.branch}]"
+        return final_text
     if report.kept:
         final_text += f"\n[Worktree 保留在 {report.path}，分支 {report.branch}]"
     return final_text

@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from .git import _resolve_head_sha_from_fs
+from .git import _resolve_head_sha_from_fs, _resolve_initial_head_sha_from_fs
 from .session import WorktreeSession, clear_session, load_session
 
 DEFAULT_SYMLINK_DIRS = ["node_modules", ".venv", "vendor"]
@@ -61,6 +61,8 @@ class Manager:
         self.active: dict[str, Worktree] = {}
         self._current_session: WorktreeSession | None = None
         self._pending_names: set[str] = set()
+        self._busy_names: set[str] = set()
+        self._session_busy = False
         Path(self.worktree_dir).mkdir(parents=True, exist_ok=True)
         self._load_current_session()
         self._restore_active()
@@ -71,14 +73,22 @@ class Manager:
         try:
             session = load_session(path)
         except (OSError, TypeError, ValueError) as exc:
-            print(f"worktree: session 文件无效，已清空: {exc}", file=sys.stderr)
-            clear_session(path)
+            self._clear_invalid_session(path, f"session 文件无效: {exc}")
             return
         if session is not None and not Path(session.worktree_path).is_dir():
-            print("worktree: session worktree gone, cleared", file=sys.stderr)
-            clear_session(path)
+            self._clear_invalid_session(path, "session 对应的 Worktree 已丢失")
             return
         self._current_session = session
+
+    @staticmethod
+    def _clear_invalid_session(path: Path, reason: str) -> None:
+        """损坏的恢复信息不能阻断启动，清理失败也只告警。"""
+
+        print(f"worktree: {reason}，正在清空", file=sys.stderr)
+        try:
+            clear_session(path)
+        except OSError as exc:
+            print(f"worktree: session 清理失败: {exc}", file=sys.stderr)
 
     def _restore_active(self) -> None:
         for directory in Path(self.worktree_dir).iterdir():
@@ -87,14 +97,16 @@ class Manager:
             head_sha = _resolve_head_sha_from_fs(directory)
             if not head_sha:
                 continue
+            initial_sha = _resolve_initial_head_sha_from_fs(directory)
             flat = directory.name
             name = flat.replace("+", "/")
             self.active[name] = Worktree(
                 name=name,
                 path=str(directory.resolve()),
                 branch=f"worktree-{flat}",
-                based_on=head_sha,
-                head_commit=head_sha,
+                based_on=initial_sha or head_sha,
+                # 无法恢复创建基线时使用空值，使后续变更检测 fail closed。
+                head_commit=initial_sha or "",
                 created=datetime.fromtimestamp(directory.stat().st_mtime),
                 manual=_EPHEMERAL_PATTERN.fullmatch(flat) is None,
             )

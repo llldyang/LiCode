@@ -86,6 +86,15 @@ def test_isolation_defaults_to_empty() -> None:
     assert definition.isolation == ""
 
 
+@pytest.mark.parametrize("value", ["false", "[]", "{}", "1"])
+def test_non_string_isolation_warns_and_falls_back(
+    value: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    definition = parse_definition(definition_bytes(f"isolation: {value}\n"), "bad.md", Source.USER)
+    assert definition.isolation == ""
+    assert "unknown isolation" in capsys.readouterr().err
+
+
 def test_parse_file_and_bom(tmp_path: Path) -> None:
     path = tmp_path / "agent.md"
     path.write_bytes(b"\xef\xbb\xbf" + definition_bytes(body="完整正文\n第二行"))

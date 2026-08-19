@@ -7,6 +7,15 @@ import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+_STRING_FIELDS = {
+    "original_cwd",
+    "worktree_path",
+    "worktree_name",
+    "original_branch",
+    "original_head_commit",
+    "session_id",
+}
+
 
 @dataclass
 class WorktreeSession:
@@ -26,7 +35,23 @@ class WorktreeSession:
         value = json.loads(raw)
         if not isinstance(value, dict):
             raise ValueError("Worktree session 必须是 JSON 对象")
-        return cls(**value)
+        allowed = _STRING_FIELDS | {"hook_based"}
+        unknown = sorted(set(value) - allowed)
+        missing = sorted(_STRING_FIELDS - set(value))
+        if unknown:
+            raise ValueError(f"Worktree session 包含未知字段: {', '.join(unknown)}")
+        if missing:
+            raise ValueError(f"Worktree session 缺少字段: {', '.join(missing)}")
+        for field_name in _STRING_FIELDS:
+            if not isinstance(value[field_name], str):
+                raise ValueError(f"Worktree session 字段 {field_name} 必须是字符串")
+        hook_based = value.get("hook_based", False)
+        if not isinstance(hook_based, bool):
+            raise ValueError("Worktree session 字段 hook_based 必须是布尔值")
+        return cls(
+            **{field_name: value[field_name] for field_name in _STRING_FIELDS},
+            hook_based=hook_based,
+        )
 
 
 def load_session(path: Path) -> WorktreeSession | None:

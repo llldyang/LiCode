@@ -44,9 +44,9 @@ async def handle_worktree(ui: UI, args: str) -> None:
         for item in summaries:
             tags = []
             if item.active:
-                tags.append("active")
+                tags.append("当前")
             if item.manual:
-                tags.append("manual")
+                tags.append("手动")
             suffix = " ".join(f"[{tag}]" for tag in tags)
             ui.println(f"{item.name}  {item.path}  {item.branch}  {suffix}".rstrip())
         return

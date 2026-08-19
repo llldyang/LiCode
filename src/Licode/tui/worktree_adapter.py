@@ -37,11 +37,17 @@ class WorktreeAdapter:
         session = self.manager.current_session()
         if session is None:
             raise ValueError("当前没有 Worktree 会话")
-        report = await self.manager.exit(
-            session.worktree_name,
-            ExitAction(action),
-            ExitOptions(discard_changes=discard),
-        )
+        try:
+            report = await self.manager.exit(
+                session.worktree_name,
+                ExitAction(action),
+                ExitOptions(discard_changes=discard),
+            )
+        except BaseException:
+            # 删除阶段失败时 Manager 可能已经完成退出，TUI cwd 必须跟随真实 session 状态。
+            if self.manager.current_session() is None:
+                self.set_active_cwd(session.original_cwd)
+            raise
         self.set_active_cwd(session.original_cwd)
         return report.removed
 

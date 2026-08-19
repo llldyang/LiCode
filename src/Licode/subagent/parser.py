@@ -100,8 +100,15 @@ def parse_definition(data: bytes, file_path: str, source: Source) -> Definition:
     if not isinstance(background_raw, bool):
         raise ValueError("background 必须是布尔值")
 
-    isolation = str(frontmatter.get("isolation") or "").strip()
-    if isolation not in VALID_ISOLATIONS:
+    isolation_raw = frontmatter.get("isolation", "")
+    isolation = isolation_raw.strip() if isinstance(isolation_raw, str) else ""
+    if isolation_raw is not None and not isinstance(isolation_raw, str):
+        print(
+            f'unknown isolation "{isolation_raw}" in {file_path}; defaulting to empty',
+            file=sys.stderr,
+        )
+        isolation = ""
+    elif isolation not in VALID_ISOLATIONS:
         print(
             f'unknown isolation "{isolation}" in {file_path}; defaulting to empty',
             file=sys.stderr,

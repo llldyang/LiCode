@@ -197,7 +197,7 @@ async def test_handle_worktree_all_subcommands() -> None:
     assert ("enter", "demo") in ui.accessor.calls
     assert ("exit", "remove", True) in ui.accessor.calls
     assert ("remove", "demo", True) in ui.accessor.calls
-    assert any("[manual]" in line for line in ui.printed)
+    assert any("[手动]" in line for line in ui.printed)
 
 
 async def test_handle_worktree_reports_unavailable() -> None:

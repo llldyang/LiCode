@@ -71,6 +71,14 @@ async def test_create_setup_and_fast_recovery(tmp_path: Path, monkeypatch) -> No
         check=True,
     ).stdout.strip()
     assert Path(hooks).resolve() == (repo / ".husky").resolve()
+    root_hooks = subprocess.run(
+        ["git", "config", "--get", "core.hooksPath"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert root_hooks.returncode == 1
 
     manager.active.clear()
 
