@@ -398,6 +398,53 @@ class BlockingTool(ProbeTool):
         return Result("不应完成")
 
 
+class DangerousBashProbe(ProbeTool):
+    """记录危险命令是否越过权限引擎到达执行层。"""
+
+    read_only = False
+
+    def __init__(self) -> None:
+        self.executed = False
+
+    def name(self) -> str:
+        return "bash"
+
+    async def execute(self, args: str) -> Result:
+        self.executed = True
+        return Result("危险命令不应执行")
+
+
+@pytest.mark.asyncio
+async def test_blacklisted_command_is_backfilled_without_execution_in_bypass() -> None:
+    tool = DangerousBashProbe()
+    registry = Registry()
+    registry.register(tool)
+    call = ToolCall("danger", "bash", json.dumps({"command": "rm -rf /"}))
+    provider = FakeProvider(
+        [
+            [StreamEvent(tool_calls=[call]), StreamEvent(done=True)],
+            [StreamEvent(text="已停止危险操作"), StreamEvent(done=True)],
+        ]
+    )
+    conversation = Conversation()
+    conversation.add_user("执行危险命令")
+
+    outputs = [
+        output
+        async for output in Agent(provider, registry, "test", permission_engine()).run(
+            conversation, Mode.BYPASS, asyncio.Event()
+        )
+    ]
+
+    result = conversation.messages()[2].tool_results[0]
+    assert not tool.executed
+    assert result.tool_call_id == "danger"
+    assert result.is_error and "危险命令黑名单" in result.content
+    assert provider.call_count == 2
+    assert conversation.messages()[-1].content == "已停止危险操作"
+    assert not any(isinstance(output, ApprovalRequest) for output in outputs)
+
+
 @pytest.mark.asyncio
 async def test_cancellation_completes_history_and_allows_next_turn() -> None:
     registry = Registry()

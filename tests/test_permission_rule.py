@@ -19,10 +19,15 @@ from Licode.permission.settings import (
 
 def test_rule_parsing_and_command_file_globs() -> None:
     command, error = parse_rule("Bash(git *)")
+    exact_command, exact_error = parse_rule("Bash(git status)")
     whole_tool, whole_error = parse_rule("Read")
 
     assert error is None and command is not None and command.tool == "Bash"
     assert command.raw == "git *" and command.matcher is not None
+    assert exact_error is None and exact_command is not None
+    assert exact_command.matcher is not None
+    assert exact_command.matcher.match("git status")
+    assert not exact_command.matcher.match("git push")
     assert whole_error is None and whole_tool is not None and whole_tool.matcher is None
     assert parse_rule("Bash(git *")[0] is None
     assert match_pattern("git *", "git status", is_file=False)
