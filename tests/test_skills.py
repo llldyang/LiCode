@@ -1,6 +1,8 @@
 import asyncio
 import json
+import threading
 from collections.abc import AsyncIterator
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import httpx
@@ -9,6 +11,7 @@ import pytest
 from Licode.agent import Agent, ApprovalRequest
 from Licode.command import NopUI, register_builtins
 from Licode.command import Registry as CommandRegistry
+from Licode.command.builtin_skill import handle_skill
 from Licode.command.skills import register_skills_as_commands, remove_skill_commands
 from Licode.config import ProviderConfig
 from Licode.conversation import Conversation
@@ -28,6 +31,7 @@ from Licode.skills import (
     SkillInstallError,
     SkillParseError,
     SkillSource,
+    SkillSummary,
     filter_tool_registry,
     install_from_url,
     parse_frontmatter,
@@ -96,6 +100,8 @@ class RecordingUI(NopUI):
         self.errors: list[str] = []
         self.injections: list[tuple[str, str]] = []
         self.assistant_messages: list[str] = []
+        self.catalog_skills: list[SkillSummary] = []
+        self.active_skill_names: list[str] = []
 
     def println(self, msg: str) -> None:
         self.printed.append(msg)
@@ -108,6 +114,12 @@ class RecordingUI(NopUI):
 
     def append_assistant_message(self, text: str) -> None:
         self.assistant_messages.append(text)
+
+    def list_catalog_skills(self) -> list[SkillSummary]:
+        return list(self.catalog_skills)
+
+    def list_active_skills(self) -> list[str]:
+        return list(self.active_skill_names)
 
 
 def write_skill(
@@ -218,6 +230,26 @@ def test_parser_reports_missing_and_invalid_utf8_files(tmp_path: Path) -> None:
         parse_skill_file(invalid, SkillSource.PROJECT)
 
 
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        "allowed_tools: read_file",
+        "allowed_tools: [read_file, 1]",
+        "model: ''",
+        "model: 1",
+    ],
+)
+def test_parser_rejects_invalid_allowed_tools_and_model(tmp_path: Path, metadata: str) -> None:
+    path = tmp_path / "bad-meta.md"
+    path.write_text(
+        f"---\nname: bad-meta\ndescription: bad\n{metadata}\n---\nbody",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SkillParseError):
+        parse_skill_file(path, SkillSource.PROJECT)
+
+
 def test_substitute_arguments_replaces_all_occurrences() -> None:
     assert substitute_arguments("$ARGUMENTS + $ARGUMENTS", "目标") == "目标 + 目标"
     assert substitute_arguments("没有占位符", "目标") == "没有占位符"
@@ -285,6 +317,34 @@ def test_catalog_reload_reports_added_removed_and_validates_tools(tmp_path: Path
     assert catalog.names() == []
 
 
+def test_catalog_get_and_reload_do_not_restore_a_removed_skill(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    skill_path = write_skill(tmp_path / ".Licode" / "skills", "race", "旧版本")
+    catalog = isolated_catalog(tmp_path)
+    entered = threading.Event()
+    release = threading.Event()
+    original_parse = parse_skill_file
+
+    def blocking_parse(*args: object, **kwargs: object):  # type: ignore[no-untyped-def]
+        entered.set()
+        assert release.wait(timeout=5)
+        return original_parse(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr("Licode.skills.catalog.parse_skill_file", blocking_parse)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        get_future = pool.submit(catalog.get, "race")
+        assert entered.wait(timeout=5)
+        skill_path.unlink()
+        reload_future = pool.submit(catalog.reload)
+        release.set()
+        assert get_future.result(timeout=5) is not None
+        reload_future.result(timeout=5)
+
+    assert catalog.names() == []
+    assert catalog.get("race") is None
+
+
 def test_active_skills_preserve_order_replace_and_clear() -> None:
     active = ActiveSkills()
     active.activate("one", "v1")
@@ -298,6 +358,20 @@ def test_active_skills_preserve_order_replace_and_clear() -> None:
     ]
     active.clear()
     assert active.snapshot() == []
+
+
+def test_active_skills_support_concurrent_activation_and_snapshots() -> None:
+    active = ActiveSkills()
+
+    def activate(index: int) -> None:
+        active.activate(f"skill-{index % 8}", f"body-{index}")
+        active.snapshot()
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(activate, range(80)))
+
+    assert set(active.names()) == {f"skill-{index}" for index in range(8)}
+    assert len(active.snapshot()) == 8
 
 
 def test_render_body_and_prompt_blocks(tmp_path: Path) -> None:
@@ -352,7 +426,12 @@ def test_filter_tool_registry_applies_allowlist_and_keeps_system_tools() -> None
 
 @pytest.mark.asyncio
 async def test_load_skill_tool_activates_latest_body_and_reports_unknown(tmp_path: Path) -> None:
-    skill_path = write_skill(tmp_path / ".Licode" / "skills", "load-me", "第一版")
+    skill_path = write_skill(
+        tmp_path / ".Licode" / "skills",
+        "load-me",
+        "第一版",
+        allowed_tools=["read_file"],
+    )
     catalog = isolated_catalog(tmp_path)
     active = ActiveSkills()
     tool = LoadSkillTool(catalog, active)
@@ -366,7 +445,8 @@ async def test_load_skill_tool_activates_latest_body_and_reports_unknown(tmp_pat
 
     assert not result.is_error
     assert result.content == "Skill load-me activated. SOP pinned to env context."
-    assert active.snapshot()[0].body == "热更新版"
+    assert active.snapshot()[0].body.endswith("热更新版")
+    assert "only these tools: read_file" in active.snapshot()[0].body
     assert unknown.is_error and "available: load-me" in unknown.content
     assert tool.read_only and tool.is_system and tool.is_system_tool
 
@@ -406,7 +486,7 @@ async def test_load_skill_runs_without_approval_and_pins_next_iteration(tmp_path
 
 @pytest.mark.asyncio
 async def test_skill_commands_inline_and_conflict_handling(tmp_path: Path) -> None:
-    write_skill(tmp_path / ".Licode" / "skills", "custom", "自定义 SOP")
+    custom_path = write_skill(tmp_path / ".Licode" / "skills", "custom", "自定义 SOP")
     write_skill(tmp_path / ".Licode" / "skills", "review", "冲突 SOP")
     catalog = isolated_catalog(tmp_path)
     active = ActiveSkills()
@@ -427,14 +507,30 @@ async def test_skill_commands_inline_and_conflict_handling(tmp_path: Path) -> No
     assert custom is not None and custom.description.endswith("[skill]")
     assert review is not None and not review.description.endswith("[skill]")
 
+    custom_path.write_text(
+        custom_path.read_text(encoding="utf-8").replace("自定义 SOP", "热更新 SOP"),
+        encoding="utf-8",
+    )
     ui = RecordingUI()
     await custom.handler(ui)
     assert active.names() == ["custom"]
+    assert active.snapshot()[0].body == "热更新 SOP"
     assert ui.injections == [("/custom", "请按照已激活的 custom Skill 执行。")]
 
     remove_skill_commands(commands)
     assert commands.lookup("custom") is None
     assert commands.lookup("review") is review
+
+
+@pytest.mark.asyncio
+async def test_skill_command_lists_source_mode_and_active_items() -> None:
+    ui = RecordingUI()
+    ui.catalog_skills = [SkillSummary("review-code", "检查代码", "project", "fork")]
+    ui.active_skill_names = ["review-code"]
+
+    await handle_skill(ui)
+
+    assert ui.printed == ["review-code  检查代码  [project/fork]\n\nActive: review-code"]
 
 
 @pytest.mark.asyncio
@@ -461,6 +557,8 @@ async def test_executor_fork_isolates_history_and_filters_tools(tmp_path: Path) 
         permission_engine(tmp_path),
         "test",
         [provider_config()],
+        instruction_text="项目指令",
+        memory_text="项目记忆",
     )
     executor.bind(provider, conversation)
     skill = catalog.get("forked")
@@ -477,6 +575,49 @@ async def test_executor_fork_isolates_history_and_filters_tools(tmp_path: Path) 
         "read_file",
         "LoadSkill",
     ]
+    assert "项目指令" in provider.requests[0].system.stable
+    assert "项目记忆" in provider.requests[0].system.stable
+    assert "## Available Skills" in provider.requests[0].system.stable
+
+
+@pytest.mark.asyncio
+async def test_executor_fork_uses_and_cleans_temporary_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_skill(
+        tmp_path / ".Licode" / "skills",
+        "temporary",
+        "临时执行",
+        mode="fork",
+    )
+    catalog = isolated_catalog(tmp_path)
+    executor = Executor(
+        catalog,
+        ActiveSkills(),
+        ToolRegistry(),
+        permission_engine(tmp_path),
+        "test",
+        [provider_config()],
+    )
+    executor.bind(FakeProvider([]), Conversation())
+    observed: list[Path] = []
+
+    async def fake_launch(options: object) -> str:
+        runtime = options.runtime  # type: ignore[attr-defined]
+        session_dir = Path(runtime.session.session_dir)
+        observed.append(session_dir)
+        assert session_dir.is_dir()
+        assert Path(runtime.session.spill_dir).is_dir()
+        assert runtime.context_window == 128000
+        return "临时结果"
+
+    monkeypatch.setattr("Licode.agent.launch.launch_fork", fake_launch)
+    skill = catalog.get("temporary")
+    assert skill is not None
+
+    assert await executor.execute_fork(skill, "") == "临时结果"
+    assert len(observed) == 1
+    assert not observed[0].exists()
 
 
 def test_executor_builds_none_recent_and_full_fork_contexts(tmp_path: Path) -> None:
@@ -516,6 +657,40 @@ def test_executor_builds_none_recent_and_full_fork_contexts(tmp_path: Path) -> N
     assert len(full) == 1
     assert full[0].content.startswith("## Previous conversation summary")
     assert "user: u0" in full[0].content and "assistant: a3" in full[0].content
+
+
+def test_executor_selects_configured_fork_model_and_context_window(tmp_path: Path) -> None:
+    write_skill(
+        tmp_path / ".Licode" / "skills",
+        "modeled",
+        mode="fork",
+        model="review-provider",
+    )
+    catalog = isolated_catalog(tmp_path)
+    executor = Executor(
+        catalog,
+        ActiveSkills(),
+        ToolRegistry(),
+        permission_engine(tmp_path),
+        "test",
+        [
+            provider_config(),
+            ProviderConfig(
+                name="review-provider",
+                protocol="openai",
+                api_key="test",
+                model="review-model",
+                context_window=64000,
+            ),
+        ],
+    )
+    skill = catalog.get("modeled")
+    assert skill is not None
+
+    provider, context_window = executor._select_provider(skill)
+
+    assert provider.model == "review-model"
+    assert context_window == 64000
 
 
 @pytest.mark.parametrize(
@@ -622,6 +797,120 @@ async def test_download_tree_enforces_declared_file_limit(tmp_path: Path) -> Non
 
 
 @pytest.mark.asyncio
+async def test_download_tree_enforces_actual_file_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("Licode.skills.install.MAX_FILE_SIZE", 1)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "api.github.com":
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "type": "file",
+                        "path": "skills/demo/file.txt",
+                        "size": 1,
+                        "download_url": "https://raw.example/file.txt",
+                    }
+                ],
+            )
+        return httpx.Response(200, content=b"xx")
+
+    source = parse_skill_url("https://github.com/acme/repo/tree/main/skills/demo")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(SkillInstallError, match="单文件超过"):
+            await _download_tree(client, source, tmp_path)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("limit_name", "limit_value", "entries", "error"),
+    [
+        (
+            "MAX_FILE_COUNT",
+            1,
+            [
+                {
+                    "type": "file",
+                    "path": "skills/demo/one.txt",
+                    "size": 1,
+                    "download_url": "https://raw.example/one.txt",
+                },
+                {
+                    "type": "file",
+                    "path": "skills/demo/two.txt",
+                    "size": 1,
+                    "download_url": "https://raw.example/two.txt",
+                },
+            ],
+            "文件数超过",
+        ),
+        (
+            "MAX_TOTAL_SIZE",
+            1,
+            [
+                {
+                    "type": "file",
+                    "path": "skills/demo/two-bytes.txt",
+                    "size": 2,
+                    "download_url": "https://raw.example/two-bytes.txt",
+                }
+            ],
+            "总大小超过",
+        ),
+    ],
+)
+async def test_download_tree_enforces_file_count_and_total_size(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    limit_name: str,
+    limit_value: int,
+    entries: list[dict[str, object]],
+    error: str,
+) -> None:
+    monkeypatch.setattr(f"Licode.skills.install.{limit_name}", limit_value)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "api.github.com":
+            return httpx.Response(200, json=entries)
+        return httpx.Response(200, content=b"xx")
+
+    source = parse_skill_url("https://github.com/acme/repo/tree/main/skills/demo")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(SkillInstallError, match=error):
+            await _download_tree(client, source, tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_download_tree_rejects_deep_or_unsupported_entries(tmp_path: Path) -> None:
+    responses = [
+        [
+            {
+                "type": "file",
+                "path": "skills/demo/a/b/c/d/e/file.txt",
+                "size": 1,
+                "download_url": "https://raw.example/file.txt",
+            }
+        ],
+        [
+            {
+                "type": "symlink",
+                "path": "skills/demo/link",
+            }
+        ],
+    ]
+    source = parse_skill_url("https://github.com/acme/repo/tree/main/skills/demo")
+    for payload in responses:
+        transport = httpx.MockTransport(
+            lambda request, value=payload: httpx.Response(200, json=value)
+        )
+        async with httpx.AsyncClient(transport=transport) as client:
+            with pytest.raises(SkillInstallError):
+                await _download_tree(client, source, tmp_path)
+
+
+@pytest.mark.asyncio
 async def test_install_from_url_is_atomic_reloads_and_cleans_staging(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -674,6 +963,42 @@ async def test_install_rejects_missing_skill_file_and_cleans_staging(
             install_root=install_root,
         )
     assert not list(install_root.parent.glob(".Licode-skill-*"))
+
+
+@pytest.mark.asyncio
+async def test_install_network_failure_cleans_staging_and_tool_reports_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    install_root = tmp_path / "home" / "skills"
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+    catalog = Catalog(work_dir)
+    catalog._user_dir = install_root
+
+    async def fail_download(client: object, source: object, staging: Path) -> None:
+        del client, source, staging
+        raise SkillInstallError("网络中断")
+
+    monkeypatch.setattr("Licode.skills.install._download_tree", fail_download)
+    with pytest.raises(SkillInstallError, match="网络中断"):
+        await install_from_url(
+            "https://skills.sh/acme/repo/demo",
+            catalog,
+            work_dir,
+            install_root=install_root,
+        )
+    assert not list(install_root.parent.glob(".Licode-skill-*"))
+
+    async def fail_install(url: str, got_catalog: Catalog, got_work_dir: Path) -> str:
+        del url, got_catalog, got_work_dir
+        raise SkillInstallError("网络中断")
+
+    monkeypatch.setattr("Licode.tool.install_skill.install_from_url", fail_install)
+    result = await InstallSkillTool(catalog, work_dir).execute(
+        json.dumps({"url": "https://skills.sh/acme/repo/demo"})
+    )
+    assert result.is_error
+    assert result.content == "Skill 安装失败: 网络中断"
 
 
 def test_replace_directory_rolls_back_existing_version(

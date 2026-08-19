@@ -123,6 +123,11 @@ async def _download_tree(
             item_path = entry.get("path")
             if not isinstance(item_path, str):
                 raise SkillInstallError("GitHub API 条目缺少 path")
+            relative = _safe_relative(source.path, item_path)
+            # 同时校验 API 返回的真实相对层级，防止服务端把深层文件直接塞进浅层响应。
+            item_depth = len(relative.parts) if item_type == "dir" else len(relative.parts) - 1
+            if item_depth > MAX_RECURSION_DEPTH:
+                raise SkillInstallError(f"Skill 目录深度超过 {MAX_RECURSION_DEPTH}")
             if item_type == "dir":
                 await walk(item_path, depth + 1)
                 continue
@@ -152,7 +157,6 @@ async def _download_tree(
             total_size += len(content)
             if total_size > MAX_TOTAL_SIZE:
                 raise SkillInstallError(f"Skill 总大小超过 {MAX_TOTAL_SIZE} 字节")
-            relative = _safe_relative(source.path, item_path)
             target = staging / relative
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(content)

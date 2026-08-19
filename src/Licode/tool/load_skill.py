@@ -5,6 +5,7 @@ from typing import Any
 
 from Licode.skills.active import ActiveSkills, current_active_skills
 from Licode.skills.catalog import Catalog
+from Licode.skills.render import render_body
 
 from . import Result
 
@@ -44,7 +45,8 @@ class LoadSkillTool:
         if skill is None:
             available = ", ".join(self._catalog.names()) or "(none)"
             return Result(f"unknown skill: {name}; available: {available}", is_error=True)
-        current_active_skills(self._active).activate(skill.name, skill.prompt_body)
+        # 自然语言触发与显式 /skill 命令共享渲染逻辑，确保工具提示也进入 SOP。
+        current_active_skills(self._active).activate(skill.name, render_body(skill, ""))
         return Result(f"Skill {skill.name} activated. SOP pinned to env context.")
 
 

@@ -39,20 +39,24 @@ class Catalog:
         return catalog
 
     def reload(self, work_dir: Path | str | None = None) -> tuple[set[str], set[str]]:
-        if work_dir is not None:
-            self._work_dir = Path(work_dir).resolve()
-            self._project_dir = self._work_dir / PROJECT_SKILLS_DIR
+        with self._lock:
+            next_work_dir = Path(work_dir).resolve() if work_dir is not None else self._work_dir
+            user_dir = self._user_dir
+        project_dir = next_work_dir / PROJECT_SKILLS_DIR
 
         loaded: dict[str, Skill] = {}
         for directory, source in (
-            (self._user_dir, SkillSource.USER),
-            (self._project_dir, SkillSource.PROJECT),
+            (user_dir, SkillSource.USER),
+            (project_dir, SkillSource.PROJECT),
         ):
             for skill in self._scan_directory(directory, source):
                 loaded[skill.name] = skill
 
         with self._lock:
             before = set(self._by_name)
+            # 扫描在锁外完成，最终一次性交换快照，读取方不会看到半加载状态。
+            self._work_dir = next_work_dir
+            self._project_dir = project_dir
             self._by_name = loaded
             self._cache = dict(loaded)
             self._order = sorted(loaded)
@@ -81,25 +85,25 @@ class Catalog:
         with self._lock:
             skill = self._by_name.get(name)
             fallback = self._cache.get(name)
-        if skill is None:
-            return None
-        try:
-            refreshed = parse_skill_file(
-                skill.source_path,
-                skill.source,
-                is_directory=skill.is_directory,
-            )
-            if refreshed.name != name:
-                raise SkillParseError(f"热重载后的名称从 {name} 变为 {refreshed.name}")
-        except SkillParseError as exc:
-            logger.warning(
-                "Reloading %s skill '%s' failed, using cache: %s",
-                skill.source.value,
-                name,
-                exc,
-            )
-            return fallback
-        with self._lock:
+            if skill is None:
+                return None
+            # 文件读取也纳入同一临界区，避免 get 与 reload 交错后写回过期来源。
+            try:
+                refreshed = parse_skill_file(
+                    skill.source_path,
+                    skill.source,
+                    is_directory=skill.is_directory,
+                )
+                if refreshed.name != name:
+                    raise SkillParseError(f"热重载后的名称从 {name} 变为 {refreshed.name}")
+            except SkillParseError as exc:
+                logger.warning(
+                    "Reloading %s skill '%s' failed, using cache: %s",
+                    skill.source.value,
+                    name,
+                    exc,
+                )
+                return fallback
             self._by_name[name] = refreshed
             self._cache[name] = refreshed
         return refreshed

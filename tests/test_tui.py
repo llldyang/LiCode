@@ -738,6 +738,7 @@ async def test_tui_clear_opens_new_session_and_keeps_old_archive(
     )
     old_id = runtime.session.session_id
     old_path = writer.path
+    runtime.active_skills.activate("old-skill", "旧 SOP")
 
     async with app.run_test() as pilot:
         await pilot.pause()
@@ -749,6 +750,7 @@ async def test_tui_clear_opens_new_session_and_keeps_old_archive(
         assert app.runtime.session.session_id != old_id
         assert app.session_path() != old_path
         assert app.conv.length() == 0
+        assert app.list_active_skills() == []
         assert app.usage_in() == app.usage_out() == 0
         assert "开启新 session" in app._transcript[-1].plain
         assert Path(old_path).read_text(encoding="utf-8")

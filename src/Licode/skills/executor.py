@@ -3,8 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import tempfile
+from pathlib import Path
 from typing import TYPE_CHECKING
 
+from Licode.compact import (
+    CompactCircuitBreaker,
+    ContentReplacementState,
+    RecoveryState,
+    SessionContext,
+)
 from Licode.config import ProviderConfig, effective_context_window
 from Licode.conversation import Conversation
 from Licode.llm import ROLE_ASSISTANT, ROLE_USER, Message, Provider, new_provider
@@ -147,24 +155,44 @@ class Executor:
         provider: Provider,
         context_window: int,
     ) -> str:
+        from Licode.agent import SessionRuntime
         from Licode.agent.launch import ForkLaunchOpts, launch_fork
 
-        del skill, context_window
-        return await launch_fork(
-            ForkLaunchOpts(
-                allowed_tools=[name for name, _ in registry.items()],
-                model=provider.model,
-                conv=conversation,
-                system_prompt="",
-                background=False,
-                events_sink=None,
-                provider=provider,
-                registry=registry,
-                engine=self.engine,
-                version=self.version,
-                hook_engine=None,
+        # Skill fork 的压缩落盘只在临时目录中存在，不能污染主会话归档。
+        with tempfile.TemporaryDirectory(prefix="Licode-skill-fork-") as temp_dir:
+            session_dir = Path(temp_dir)
+            spill_dir = session_dir / "tool-results"
+            spill_dir.mkdir()
+            runtime = SessionRuntime(
+                replacement=ContentReplacementState(),
+                recovery=RecoveryState(),
+                auto_tracking=CompactCircuitBreaker(),
+                session=SessionContext(
+                    session_id=f"fork-{skill.name}",
+                    session_dir=str(session_dir),
+                    spill_dir=str(spill_dir),
+                ),
+                context_window=context_window,
             )
-        )
+            return await launch_fork(
+                ForkLaunchOpts(
+                    allowed_tools=[name for name, _ in registry.items()],
+                    model=provider.model,
+                    conv=conversation,
+                    system_prompt="",
+                    background=False,
+                    events_sink=None,
+                    provider=provider,
+                    registry=registry,
+                    engine=self.engine,
+                    version=self.version,
+                    hook_engine=None,
+                    runtime=runtime,
+                    catalog=self.catalog,
+                    instruction_text=self.instruction_text,
+                    memory_text=self.memory_text,
+                )
+            )
 
 
 SkillExecutor = Executor
