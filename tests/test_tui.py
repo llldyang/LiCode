@@ -10,7 +10,7 @@ from rich.console import Console
 from textual.pilot import Pilot
 from textual.widgets import OptionList, Static
 
-from Licode.agent import CompactEvent, CompactPhase, SessionRuntime
+from Licode.agent import NOTICE_CANCELLED, CompactEvent, CompactPhase, SessionRuntime
 from Licode.command import Command, Kind, Registry, register_builtins
 from Licode.command.builtin_prompt import REVIEW_DIRECTIVE
 from Licode.compact import (
@@ -25,7 +25,7 @@ from Licode.hook.engine import Engine as HookEngine
 from Licode.hook.executor import ExecutionResult
 from Licode.hook.rule import Action, ActionType, PromptAction
 from Licode.hook.rule import Rule as HookRule
-from Licode.llm import PromptTooLongError, Request, StreamEvent, ToolCall
+from Licode.llm import PromptTooLongError, Request, StreamEvent, ToolCall, Usage
 from Licode.permission import Engine, Mode
 from Licode.permission.matcher import compile_matcher
 from Licode.permission.rule import Rule
@@ -34,7 +34,7 @@ from Licode.session import Writer, list_sessions
 from Licode.tool import new_default_registry
 from Licode.tui.app import LiCodeApp, MessageInput, SessionState
 from Licode.tui.complete import MAX_ROWS, CompletionMenu
-from Licode.tui.view import format_compact_notice, tool_result_summary
+from Licode.tui.view import format_compact_notice, streaming_block, tool_result_summary
 
 
 class FakeProvider:
@@ -146,6 +146,13 @@ def test_tool_result_summary_limits_scrollback_noise() -> None:
     assert "[truncated]" in text
 
 
+def test_streaming_block_displays_iteration_progress() -> None:
+    output = io.StringIO()
+    Console(file=output, width=120, color_system=None).print(streaming_block("", 2.2, 3))
+
+    assert "Imagining… (2s · 第 3 轮)" in output.getvalue()
+
+
 async def wait_for_state(pilot: Pilot[None], app: LiCodeApp, expected: SessionState) -> None:
     for _ in range(200):
         if app.state is expected:
@@ -166,6 +173,22 @@ class ControlledProvider(FakeProvider):
         self.started.set()
         await self.release.wait()
         yield StreamEvent(text="**完成**")
+        yield StreamEvent(done=True)
+
+
+class CancellableProvider(FakeProvider):
+    def __init__(self) -> None:
+        super().__init__([])
+        self.started = asyncio.Event()
+
+    async def stream(self, req: Request) -> AsyncIterator[StreamEvent]:
+        self.requests.append(req)
+        self.call_count += 1
+        if self.call_count <= 2:
+            self.started.set()
+            await asyncio.Future()
+            return
+        yield StreamEvent(text="取消后继续成功")
         yield StreamEvent(done=True)
 
 
@@ -221,6 +244,68 @@ async def test_stream_error_restores_input_and_allows_next_turn(
         await wait_for_state(pilot, app, SessionState.IDLE)
         assert provider.call_count == 2
         assert app.conv.messages()[-1].content == "恢复成功"
+
+
+@pytest.mark.asyncio
+async def test_escape_and_ctrl_c_cancel_normal_stream_without_exiting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    provider = CancellableProvider()
+    app = make_app(tmp_path, monkeypatch, provider)
+
+    async with app.run_test() as pilot:
+        await app.submit("用 Esc 取消")
+        await asyncio.wait_for(provider.started.wait(), timeout=1)
+        await pilot.press("escape")
+        await wait_for_state(pilot, app, SessionState.IDLE)
+        assert app.is_running
+        assert app.conv.messages()[-1].content == NOTICE_CANCELLED
+
+        provider.started.clear()
+        await app.submit("用 Ctrl+C 取消")
+        await asyncio.wait_for(provider.started.wait(), timeout=1)
+        await pilot.press("ctrl+c")
+        await wait_for_state(pilot, app, SessionState.IDLE)
+        assert app.is_running
+        assert app.conv.messages()[-1].content == NOTICE_CANCELLED
+
+        await app.submit("继续")
+        await wait_for_state(pilot, app, SessionState.IDLE)
+        assert app.conv.messages()[-1].content == "取消后继续成功"
+        assert not app.query_one("#input", MessageInput).disabled
+
+
+@pytest.mark.asyncio
+async def test_tui_accumulates_usage_across_agent_iterations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "usage.txt"
+    target.write_text("用量测试", encoding="utf-8")
+    call = ToolCall("read-usage", "read_file", json.dumps({"path": str(target)}))
+    provider = FakeProvider(
+        [
+            [
+                StreamEvent(tool_calls=[call]),
+                StreamEvent(usage=Usage(1000, 200)),
+                StreamEvent(done=True),
+            ],
+            [
+                StreamEvent(text="完成"),
+                StreamEvent(usage=Usage(300, 50)),
+                StreamEvent(done=True),
+            ],
+        ]
+    )
+    app = make_app(tmp_path, monkeypatch, provider)
+
+    async with app.run_test() as pilot:
+        await app.submit("读取并总结")
+        await wait_for_state(pilot, app, SessionState.IDLE)
+
+        assert app.usage_in() == 1300
+        assert app.usage_out() == 250
+        status = rendered_status(app)
+        assert "↑1.3k ↓250 tok" in status
 
 
 @pytest.mark.asyncio
