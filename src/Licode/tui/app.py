@@ -420,6 +420,8 @@ class LiCodeApp(App[None]):
         self.query_one("#log", RichLog).write(rendered_user)
         self._transcript.append(rendered_user)
         self.query_one("#input", MessageInput).text = ""
+        # 一轮请求完成前不接收新输入，但仍允许滚动和取消等界面操作。
+        self.query_one("#input", MessageInput).disabled = True
         self.cur_reply = ""
         self.cur_tools = []
         self.iter = 0
@@ -822,7 +824,8 @@ class LiCodeApp(App[None]):
         request = self.pending
         self.pending = None
         self.state = self._approval_return_state
-        self.query_one("#input", MessageInput).disabled = False
+        # 审批结束通常仍处于模型流式阶段，输入框应由整轮结束逻辑统一恢复。
+        self.query_one("#input", MessageInput).disabled = self.state is not SessionState.IDLE
         if request is not None and not request.respond.done():
             request.respond.set_result(outcome)
 

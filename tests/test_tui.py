@@ -32,7 +32,7 @@ from Licode.permission.rule import Rule
 from Licode.prompt import EXECUTE_DIRECTIVE
 from Licode.session import Writer, list_sessions
 from Licode.tool import new_default_registry
-from Licode.tui.app import LiCodeApp, SessionState
+from Licode.tui.app import LiCodeApp, MessageInput, SessionState
 from Licode.tui.complete import MAX_ROWS, CompletionMenu
 from Licode.tui.view import format_compact_notice
 
@@ -142,6 +142,124 @@ async def wait_for_state(pilot: Pilot[None], app: LiCodeApp, expected: SessionSt
         await asyncio.sleep(0.01)
         await pilot.pause(0.01)
     raise AssertionError(f"TUI 未进入预期状态: {expected}")
+
+
+class ControlledProvider(FakeProvider):
+    def __init__(self) -> None:
+        super().__init__([])
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def stream(self, req: Request) -> AsyncIterator[StreamEvent]:
+        self.requests.append(req)
+        self.started.set()
+        await self.release.wait()
+        yield StreamEvent(text="**完成**")
+        yield StreamEvent(done=True)
+
+
+@pytest.mark.asyncio
+async def test_basic_chat_input_is_disabled_until_stream_finishes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    provider = ControlledProvider()
+    app = make_app(tmp_path, monkeypatch, provider)
+
+    async with app.run_test() as pilot:
+        message_input = app.query_one("#input", MessageInput)
+        message_input.text = "第一行"
+        message_input.move_cursor((0, len(message_input.text)))
+        await pilot.press("alt+enter")
+        message_input.insert("第二行")
+        assert message_input.text == "第一行\n第二行"
+
+        await pilot.press("enter")
+        await asyncio.wait_for(provider.started.wait(), timeout=1)
+        assert app.state is SessionState.STREAMING
+        assert message_input.text == ""
+        assert message_input.disabled
+
+        provider.release.set()
+        await wait_for_state(pilot, app, SessionState.IDLE)
+        assert not message_input.disabled
+        assert provider.requests[0].messages[0].content == "第一行\n第二行"
+        assert app.conv.messages()[-1].content == "**完成**"
+        assert "完成于" in app._transcript[-1].renderables[-1].plain
+
+
+@pytest.mark.asyncio
+async def test_stream_error_restores_input_and_allows_next_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    failure = RuntimeError("模拟鉴权失败")
+    provider = FakeProvider(
+        [
+            [StreamEvent(err=failure)],
+            [StreamEvent(text="恢复成功"), StreamEvent(done=True)],
+        ]
+    )
+    app = make_app(tmp_path, monkeypatch, provider)
+
+    async with app.run_test() as pilot:
+        await app.submit("第一次")
+        await wait_for_state(pilot, app, SessionState.IDLE)
+        assert not app.query_one("#input", MessageInput).disabled
+        assert any("模拟鉴权失败" in getattr(item, "plain", str(item)) for item in app._transcript)
+
+        await app.submit("第二次")
+        await wait_for_state(pilot, app, SessionState.IDLE)
+        assert provider.call_count == 2
+        assert app.conv.messages()[-1].content == "恢复成功"
+
+
+@pytest.mark.asyncio
+async def test_single_provider_enters_chat_and_multiple_providers_require_selection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    selected: list[ProviderConfig] = []
+    fake_provider = FakeProvider([])
+
+    def select_provider(config: ProviderConfig) -> FakeProvider:
+        selected.append(config)
+        return fake_provider
+
+    monkeypatch.setattr("Licode.tui.app.new_provider", select_provider)
+    single = LiCodeApp(
+        [provider_config()],
+        "test",
+        new_default_registry(),
+        permission_engine(tmp_path),
+    )
+    async with single.run_test() as pilot:
+        await pilot.pause()
+        assert single.state is SessionState.IDLE
+        assert selected == [single.providers[0]]
+        banner = str(single._transcript[0])
+        assert "LiCode vtest" in banner
+        assert "Ready for your request" in banner
+
+    selected.clear()
+    providers = [
+        provider_config(),
+        ProviderConfig("第二个", "anthropic", "test-key-2", "second-model"),
+    ]
+    multiple = LiCodeApp(
+        providers,
+        "test",
+        new_default_registry(),
+        permission_engine(tmp_path),
+    )
+    async with multiple.run_test() as pilot:
+        await pilot.pause()
+        choices = multiple.query_one("#provider-select", OptionList)
+        assert multiple.state is SessionState.SELECTING
+        assert choices.option_count == 2
+        assert selected == []
+
+        await pilot.press("down", "enter")
+        assert multiple.state is SessionState.IDLE
+        assert selected == [providers[1]]
+        assert choices.styles.display == "none"
 
 
 @pytest.mark.asyncio
