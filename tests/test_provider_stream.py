@@ -117,7 +117,8 @@ async def test_openai_streams_text_usage_and_uses_custom_base_url(
     )
     request = Request(
         messages=[Message(role="user", content="问题")],
-        system=System(stable="系统规则"),
+        system=System(stable="系统规则", environment="动态环境"),
+        reminder="<system-reminder>补充约束</system-reminder>",
     )
 
     events = [event async for event in provider.stream(request)]
@@ -128,17 +129,39 @@ async def test_openai_streams_text_usage_and_uses_custom_base_url(
     }
     assert [event.text for event in events if event.text] == ["你", "好"]
     stream_usage = next(event.usage for event in events if event.usage is not None)
-    assert (stream_usage.input_tokens, stream_usage.output_tokens, stream_usage.cache_read) == (
+    assert (
+        stream_usage.input_tokens,
+        stream_usage.output_tokens,
+        stream_usage.cache_write,
+        stream_usage.cache_read,
+    ) == (
         12,
         3,
+        0,
         4,
     )
     assert completions.params["messages"] == [
-        {"role": "system", "content": "系统规则"},
+        {"role": "system", "content": "系统规则\n\n动态环境"},
         {"role": "user", "content": "问题"},
+        {"role": "user", "content": "<system-reminder>补充约束</system-reminder>"},
     ]
     assert completions.params["stream"] is True
     assert events[-1].done
+
+
+@pytest.mark.asyncio
+async def test_openai_missing_cache_usage_fields_fall_back_to_zero() -> None:
+    usage = SimpleNamespace(prompt_tokens=5, completion_tokens=1)
+    completions = OpenAICompletions([SimpleNamespace(choices=[], usage=usage)])
+    provider = OpenAIProvider.__new__(OpenAIProvider)
+    provider._client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    provider._model = "fake-model"
+
+    events = [event async for event in provider.stream(Request())]
+
+    stream_usage = next(event.usage for event in events if event.usage is not None)
+    assert stream_usage.cache_write == 0
+    assert stream_usage.cache_read == 0
 
 
 @pytest.mark.asyncio

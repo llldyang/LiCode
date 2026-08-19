@@ -36,9 +36,19 @@ def test_instructions_and_memory_fill_optional_modules_in_priority_order() -> No
 def test_stable_system_is_deterministic_and_contains_tool_rules() -> None:
     first = prompt.build_system_prompt()
     second = prompt.build_system_prompt()
+    changed_environment = Environment(
+        working_dir="D:/other",
+        platform="win32",
+        date="2099-12-31",
+        git_status="99 changed file(s)",
+        version="future",
+        model="other-model",
+    ).render()
     definitions = {item.name: item.description for item in new_default_registry().definitions()}
 
     assert first == second
+    assert changed_environment not in first
+    assert all(value not in first for value in ("D:/other", "2099-12-31", "other-model"))
     assert "Prefer the dedicated read_file, glob, and grep" in first
     assert "Before editing a file, you must first read it with read_file" in first
     assert "编辑前请先用 read_file" in definitions["edit_file"]
