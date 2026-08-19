@@ -5,7 +5,15 @@ from .command import ArgsHandler, Command, Handler, Kind
 from .dispatch import parse, parse_with_args
 from .registry import Registry
 from .skills import register_skills_as_commands, remove_skill_commands
-from .ui import UI, NopUI, WorktreeAccessor, WorktreeSummary
+from .ui import (
+    UI,
+    NopUI,
+    TeamAccessor,
+    TeamMemberSummary,
+    TeamSummary,
+    WorktreeAccessor,
+    WorktreeSummary,
+)
 
 __all__ = [
     "ArgsHandler",
@@ -14,6 +22,9 @@ __all__ = [
     "Kind",
     "NopUI",
     "Registry",
+    "TeamAccessor",
+    "TeamMemberSummary",
+    "TeamSummary",
     "UI",
     "WorktreeAccessor",
     "WorktreeSummary",

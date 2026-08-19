@@ -10,6 +10,7 @@ from .builtin_local import (
 )
 from .builtin_prompt import handle_do, handle_review
 from .builtin_skill import handle_skill
+from .builtin_team import handle_team, handle_team_root
 from .builtin_ui import handle_clear, handle_compact, handle_exit, handle_plan, handle_resume
 from .builtin_worktree import handle_worktree, handle_worktree_root
 from .command import Command, Kind
@@ -34,6 +35,13 @@ def register_builtins(registry: Registry) -> None:
         Command("session", "显示当前会话信息", Kind.LOCAL, handle_session),
         Command("skill", "列出已加载的 Skill", Kind.LOCAL, handle_skill),
         Command("status", "显示 LiCode 运行状态", Kind.LOCAL, handle_status),
+        Command(
+            "team",
+            "管理 Agent Team",
+            Kind.LOCAL,
+            handle_team_root,
+            args_handler=handle_team,
+        ),
         Command(
             "worktree",
             "管理 Git Worktree 隔离目录",

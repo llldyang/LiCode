@@ -5,10 +5,16 @@ from __future__ import annotations
 import asyncio
 from typing import TYPE_CHECKING
 
+from textual.message import Message as TextualMessage
+
 from Licode.task import BackgroundTask
 
 if TYPE_CHECKING:
     from .app import LiCodeApp
+
+
+class LeadMailMessage(TextualMessage):
+    """通知 Textual 主循环处理新到的 Lead 邮件。"""
 
 
 def build_task_notification(task: BackgroundTask) -> str:
@@ -42,3 +48,33 @@ async def consume_subagent_approvals(app: LiCodeApp) -> None:
             await asyncio.sleep(0.05)
         request.reason = f"[来自 SubAgent] {request.reason}"
         app._show_approval(request)
+
+
+def build_team_update_reminder(messages) -> str:
+    lines = ["<team-update>", f"收到 {len(messages)} 条队员更新:"]
+    for index, message in enumerate(messages, 1):
+        lines.append(
+            f"[{index}] team={message.team_name} 来自 {message.from_} "
+            f"(type={message.type.value},ts={message.timestamp}): {message.summary}"
+        )
+        lines.append("    " + message.content[:8000])
+    lines.append("</team-update>")
+    return "\n".join(lines)
+
+
+async def consume_lead_mail(app: LiCodeApp) -> None:
+    while True:
+        await asyncio.sleep(1.0)
+        if app.team_mgr is None:
+            continue
+        messages = await app.team_mgr.poll_lead_mailboxes()
+        if messages:
+            app.runtime.append_reminders([build_team_update_reminder(messages)])
+            app.lead_mail_event.set()
+
+
+async def wait_for_lead_mail(app: LiCodeApp) -> None:
+    while True:
+        await app.lead_mail_event.wait()
+        app.lead_mail_event.clear()
+        app.post_message(LeadMailMessage())

@@ -40,13 +40,13 @@ def resolved_target(root: str, path: str) -> str:
 
 
 def sandbox_ok(engine: Rooted, path: str) -> bool:
-    """判断解析后的路径是否位于单一项目根内。"""
+    """判断解析后的路径是否位于项目根或系统临时目录内。"""
 
     try:
         resolved = resolved_target(engine.root, path)
         root = os.path.normcase(os.path.normpath(engine.root))
         target = os.path.normcase(os.path.normpath(resolved))
-        return target == root or target.startswith(root + os.sep)
+        return target == root or target.startswith(root + os.sep) or is_system_temp_path(path)
     except (OSError, ValueError):
         return False
 
@@ -57,3 +57,17 @@ def project_relative(root: str, path: str) -> str:
     resolved = Path(resolved_target(root, path))
     relative = resolved.relative_to(Path(root))
     return relative.as_posix() or "."
+
+
+def is_system_temp_path(path: str) -> bool:
+    """仅开放文档指定的 /tmp 与 /private/tmp，仍按真实路径阻断软链逃逸。"""
+
+    try:
+        target = os.path.normcase(os.path.normpath(eval_symlinks_or_ancestor(path)))
+        roots = {
+            os.path.normcase(os.path.normpath(eval_symlinks_or_ancestor(candidate)))
+            for candidate in ("/tmp", "/private/tmp")
+        }
+    except (OSError, ValueError):
+        return False
+    return any(target == root or target.startswith(root + os.sep) for root in roots)

@@ -50,6 +50,19 @@ class CancelProbeAgent:
             self.cleaned.set()
 
 
+class MockTeamHook:
+    def __init__(self, context=("", "", False)) -> None:
+        self.context = context
+        self.requests = []
+
+    async def spawn_teammate(self, request):
+        self.requests.append(request)
+        return '{"member_name":"alice"}'
+
+    def is_teammate_context(self):
+        return self.context
+
+
 def make_tool(tmp_path, *, bg_enabled=True):
     parent = agent_for(tmp_path, FakeProvider([[StreamEvent(text="unused")]]))
     return AgentTool(MockCatalog(), Manager(), parent, bg_enabled), parent
@@ -66,6 +79,8 @@ async def test_basic_and_missing_prompt(tmp_path) -> None:
         "model",
         "run_in_background",
         "name",
+        "team_name",
+        "plan_mode_required",
     }
     result = await tool.execute('{"description":"x"}')
     assert result.is_error and "prompt is required" in result.content
@@ -180,3 +195,35 @@ async def test_foreground_cancellation_waits_for_child_cleanup(tmp_path, monkeyp
     with pytest.raises(asyncio.CancelledError):
         await running
     assert probe.cleaned.is_set()
+
+
+@pytest.mark.asyncio
+async def test_team_name_delegates_to_team_hook(tmp_path) -> None:
+    tool, _ = make_tool(tmp_path)
+    hook = MockTeamHook()
+    tool.team_hook = hook
+    result = await tool.execute(
+        json.dumps(
+            {
+                "prompt": "实现功能",
+                "description": "队员任务",
+                "team_name": "demo",
+                "name": "alice",
+                "plan_mode_required": True,
+            }
+        )
+    )
+    assert not result.is_error
+    assert hook.requests[0].team_name == "demo"
+    assert hook.requests[0].plan_mode_required is True
+
+
+@pytest.mark.asyncio
+async def test_inprocess_teammate_cannot_spawn_team_member(tmp_path) -> None:
+    tool, _ = make_tool(tmp_path)
+    tool.team_hook = MockTeamHook(("demo", "bob", True))
+    result = await tool.execute(
+        json.dumps({"prompt": "x", "description": "x", "team_name": "demo", "name": "nested"})
+    )
+    assert result.is_error
+    assert "in-process" in result.content

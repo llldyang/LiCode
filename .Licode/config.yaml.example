@@ -19,3 +19,8 @@ providers:
 # 的顺序加载，前者优先级更高。
 # .Licode/sessions/ 保存可由 /resume 恢复的对话；.Licode/memory/ 保存项目长期记忆。
 # ~/.Licode/memory/ 保存跨项目通用的用户长期记忆。
+
+# Team Fork 与 Coordinator Mode 默认关闭；Coordinator 还需环境变量双锁开启。
+features:
+  coordinator_mode: false
+  fork_teammate: false

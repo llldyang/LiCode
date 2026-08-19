@@ -1,5 +1,6 @@
 """LiCode 命令行入口。"""
 
+import argparse
 import asyncio
 import os
 import sys
@@ -18,6 +19,7 @@ from Licode import (
     skills,
     subagent,
     task,
+    team,
     worktree,
 )
 from Licode import mcp as mcp_client
@@ -29,13 +31,40 @@ from Licode.compact import (
     new_session_context,
 )
 from Licode.config import ConfigError
+from Licode.coordinator import is_enabled as coordinator_enabled
+from Licode.team.tools import (
+    SendMessageTool as TeamSendMessageTool,
+)
+from Licode.team.tools import (
+    TaskCreateTool,
+    TaskUpdateTool,
+    TeamCreateTool,
+    TeamDeleteTool,
+)
+from Licode.team.tools import TaskGetTool as TeamTaskGetTool
+from Licode.team.tools import TaskListTool as TeamTaskListTool
 from Licode.tool import new_default_registry
 from Licode.tool.install_skill import InstallSkillTool
 from Licode.tool.load_skill import LoadSkillTool
 from Licode.tui import new_app
 
 
-async def _amain() -> int:
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="Licode", description="终端 AI 编程助手")
+    parser.add_argument("--team-member", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--team", default="", help=argparse.SUPPRESS)
+    parser.add_argument("--member", default="", help=argparse.SUPPRESS)
+    parser.add_argument("--agent-id", default="", help=argparse.SUPPRESS)
+    parser.add_argument("--session-dir", default="", help=argparse.SUPPRESS)
+    parser.add_argument("--worktree", default="", help=argparse.SUPPRESS)
+    parser.add_argument("--agent-type", default="", help=argparse.SUPPRESS)
+    parser.add_argument("--model", default="", help=argparse.SUPPRESS)
+    parser.add_argument("--plan-mode", action="store_true", help=argparse.SUPPRESS)
+    return parser
+
+
+async def _amain(args: argparse.Namespace | None = None) -> int:
+    args = args or _parser().parse_args([])
     writer: session.Writer | None = None
     cleanup_task: asyncio.Task[None] | None = None
     worktree_sweep_task: asyncio.Task[list[str]] | None = None
@@ -50,6 +79,10 @@ async def _amain() -> int:
         return 1
 
     try:
+        if args.team_member:
+            if not args.worktree:
+                raise ValueError("--team-member 需要 --worktree")
+            os.chdir(args.worktree)
         root = os.getcwd()
         instruction_text = instructions.Loader(root).load()
         memory_manager = memory.Manager(
@@ -108,12 +141,23 @@ async def _amain() -> int:
             worktree_sweep_task = asyncio.create_task(
                 worktree_mgr.sweep_stale(datetime.now() - timedelta(hours=24))
             )
-        task_mgr = task.Manager()
+        name_registry = team.AgentNameRegistry()
+        task_mgr = task.Manager(name_registry)
+        team_mgr = team.Manager(Path.home(), root, worktree_mgr, task_mgr, name_registry)
+        coordinator_mode = coordinator_enabled(cfg) and not args.team_member
+        team_mgr.coordinator_mode = coordinator_mode
+        legacy_task_list = task.TaskListTool(task_mgr)
+        legacy_task_get = task.TaskGetTool(task_mgr)
+        legacy_send_message = task.SendMessageTool(task_mgr)
         for task_tool in (
-            task.TaskListTool(task_mgr),
-            task.TaskGetTool(task_mgr),
+            TeamTaskListTool(team_mgr, legacy_task_list),
+            TeamTaskGetTool(team_mgr, legacy_task_get),
             task.TaskStopTool(task_mgr),
-            task.SendMessageTool(task_mgr),
+            TeamSendMessageTool(team_mgr, legacy_send_message),
+            TeamCreateTool(team_mgr),
+            TeamDeleteTool(team_mgr),
+            TaskCreateTool(team_mgr),
+            TaskUpdateTool(team_mgr),
         ):
             registry.register(task_tool)
         agent_tool = AgentTool(
@@ -122,8 +166,24 @@ async def _amain() -> int:
             parent=None,
             bg_enabled=cfg.effective_enable_subagent_background(),
             worktree_mgr=worktree_mgr,
+            team_hook=team_mgr,
         )
         registry.register(agent_tool)
+        team_mgr.configure_spawn(agent_tool, cfg)
+        task_mgr.on_task_done(team_mgr.handle_task_done)
+        if args.team_member:
+            from Licode.cli_team_member import run_team_member
+
+            return await run_team_member(
+                args,
+                cfg,
+                registry,
+                engine,
+                hook_engine,
+                team_mgr,
+                subagent_catalog,
+                agent_tool,
+            )
         app = new_app(
             cfg.providers,
             __version__,
@@ -142,6 +202,8 @@ async def _amain() -> int:
             subagent_catalog,
             agent_tool,
             worktree_mgr,
+            team_mgr,
+            coordinator_mode,
         )
         await app.run_async(inline=True, inline_no_clear=True)
         app.print_transcript()
@@ -172,8 +234,9 @@ async def _amain() -> int:
 
 
 def main() -> None:
+    args = _parser().parse_args()
     try:
-        code = asyncio.run(_amain())
+        code = asyncio.run(_amain(args))
     except KeyboardInterrupt:
         code = 0
     raise SystemExit(code)

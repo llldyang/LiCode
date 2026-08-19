@@ -17,6 +17,35 @@ class WorktreeSummary:
     manual: bool
 
 
+@dataclass
+class TeamMemberSummary:
+    name: str
+    agent_id: str
+    backend: str
+    worktree_path: str
+    pane_id: str
+    is_active: bool | None
+    task_count: int = 0
+
+
+@dataclass
+class TeamSummary:
+    name: str
+    backend: str
+    config_path: str
+    members: list[TeamMemberSummary]
+
+
+class TeamAccessor(Protocol):
+    def list(self) -> list[TeamSummary]: ...
+
+    def info(self, name: str) -> TeamSummary: ...
+
+    async def delete(self, name: str, force: bool) -> None: ...
+
+    async def kill(self, member: str) -> None: ...
+
+
 class WorktreeAccessor(Protocol):
     async def create(self, name: str) -> tuple[str, str]: ...
 
@@ -79,6 +108,8 @@ class UI(Protocol):
     def hook_rules(self) -> list[HookRule]: ...
 
     def worktree_accessor(self) -> WorktreeAccessor | None: ...
+
+    def team_accessor(self) -> TeamAccessor | None: ...
 
 
 class NopUI:
@@ -157,4 +188,7 @@ class NopUI:
         return []
 
     def worktree_accessor(self) -> WorktreeAccessor | None:
+        return None
+
+    def team_accessor(self) -> TeamAccessor | None:
         return None

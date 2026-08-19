@@ -9,7 +9,7 @@ from Licode.llm import ToolCall
 from . import Category, Decision, Mode, parse_mode
 from .blacklist import hits_blacklist, patterns
 from .rule import RuleSet
-from .sandbox import project_relative, resolve_root, sandbox_ok
+from .sandbox import is_system_temp_path, project_relative, resolve_root, sandbox_ok
 from .settings import (
     Settings,
     categorize,
@@ -46,10 +46,13 @@ class Engine:
                 return Decision.DENY, "无法解析文件路径参数，安全拒绝"
             if not sandbox_ok(self, target):
                 return Decision.DENY, f"路径在项目目录之外：{target}"
-            try:
-                rule_target = project_relative(self.root, target)
-            except (OSError, ValueError):
-                return Decision.DENY, f"路径在项目目录之外：{target}"
+            if is_system_temp_path(target):
+                rule_target = target
+            else:
+                try:
+                    rule_target = project_relative(self.root, target)
+                except (OSError, ValueError):
+                    return Decision.DENY, f"路径在项目目录之外：{target}"
 
         for rules in (self.local, self.project, self.user):
             decision, matched = rules.match_rule(friendly, rule_target)

@@ -86,6 +86,13 @@ def test_isolation_defaults_to_empty() -> None:
     assert definition.isolation == ""
 
 
+def test_plan_mode_required_is_parsed() -> None:
+    definition = parse_definition(
+        definition_bytes("planModeRequired: true\n"), "planner.md", Source.USER
+    )
+    assert definition.plan_mode_required is True
+
+
 @pytest.mark.parametrize("value", ["false", "[]", "{}", "1"])
 def test_non_string_isolation_warns_and_falls_back(
     value: str, capsys: pytest.CaptureFixture[str]

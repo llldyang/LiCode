@@ -100,6 +100,10 @@ def parse_definition(data: bytes, file_path: str, source: Source) -> Definition:
     if not isinstance(background_raw, bool):
         raise ValueError("background 必须是布尔值")
 
+    plan_mode_required = frontmatter.get("planModeRequired", False)
+    if not isinstance(plan_mode_required, bool):
+        raise ValueError("planModeRequired 必须是布尔值")
+
     isolation_raw = frontmatter.get("isolation", "")
     isolation = isolation_raw.strip() if isinstance(isolation_raw, str) else ""
     if isolation_raw is not None and not isinstance(isolation_raw, str):
@@ -126,6 +130,7 @@ def parse_definition(data: bytes, file_path: str, source: Source) -> Definition:
         dont_ask=dont_ask,
         background=background_raw,
         isolation=isolation,
+        plan_mode_required=plan_mode_required,
         system_prompt=body,
         file_path=file_path,
         source=source,

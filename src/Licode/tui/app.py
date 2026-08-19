@@ -56,8 +56,10 @@ from Licode.skills import Catalog, SkillSummary
 from Licode.skills.executor import Executor
 from Licode.subagent import Catalog as SubagentCatalog
 from Licode.task import Manager as TaskManager
+from Licode.team import Manager as TeamManager
 from Licode.tool import Registry as ToolRegistry
 from Licode.tool import new_default_registry, with_cwd
+from Licode.tool.filter import apply_main_agent_tool_filter
 from Licode.tool.install_skill import InstallSkillTool
 from Licode.worktree import Manager as WorktreeManager
 
@@ -65,8 +67,15 @@ from .commands import dispatch_slash
 from .complete import CompletionMenu, handle_completion_key
 from .resume import begin_resume, do_resume_session, handle_resume_key, options_for
 from .select import provider_at, provider_options
-from .stream import consume_stream, tick
-from .tasks import consume_subagent_approvals, consume_task_done
+from .stream import begin_autonomous_turn, consume_stream, tick
+from .tasks import (
+    LeadMailMessage,
+    consume_lead_mail,
+    consume_subagent_approvals,
+    consume_task_done,
+    wait_for_lead_mail,
+)
+from .team_adapter import TeamAdapter
 from .view import (
     approval_block,
     assistant_block,
@@ -199,6 +208,8 @@ class LiCodeApp(App[None]):
         subagent_catalog: SubagentCatalog | None = None,
         agent_tool: AgentTool | None = None,
         worktree_mgr: WorktreeManager | None = None,
+        team_mgr: TeamManager | None = None,
+        coordinator_mode: bool = False,
     ) -> None:
         super().__init__()
         self.state = SessionState.SELECTING if len(providers) > 1 else SessionState.IDLE
@@ -223,11 +234,16 @@ class LiCodeApp(App[None]):
         self.subagent_catalog = subagent_catalog or SubagentCatalog()
         self.agent_tool = agent_tool
         self.worktree_mgr = worktree_mgr
+        self.team_mgr = team_mgr
+        self.coordinator_mode = coordinator_mode
+        self.lead_mail_event = asyncio.Event()
         current_worktree = worktree_mgr.current_session() if worktree_mgr is not None else None
         self.active_cwd = current_worktree.worktree_path if current_worktree is not None else ""
         self.foreground_sub_agent = None
         self._task_done_consumer: asyncio.Task[None] | None = None
         self._approval_consumer: asyncio.Task[None] | None = None
+        self._lead_mail_consumer: asyncio.Task[None] | None = None
+        self._lead_mail_waiter: asyncio.Task[None] | None = None
         self._approval_return_state = self.state
         self.runtime.hook_engine = hook_engine
         self._session_end_dispatched = False
@@ -294,6 +310,9 @@ class LiCodeApp(App[None]):
             self._show_provider_selection()
         self._task_done_consumer = asyncio.create_task(consume_task_done(self))
         self._approval_consumer = asyncio.create_task(consume_subagent_approvals(self))
+        if self.team_mgr is not None:
+            self._lead_mail_consumer = asyncio.create_task(consume_lead_mail(self))
+            self._lead_mail_waiter = asyncio.create_task(wait_for_lead_mail(self))
         await self._dispatch_session_start()
 
     def _show_provider_selection(self) -> None:
@@ -328,6 +347,15 @@ class LiCodeApp(App[None]):
             memory_text=self.memory_text,
             hook_engine=self.hook_engine,
         ).with_catalog(self.catalog)
+        if self.coordinator_mode:
+            from Licode.coordinator import allowed_tools, system_prompt_suffix
+
+            self.agent.set_allowed_tools(allowed_tools())
+            self.agent.append_system_prompt(system_prompt_suffix())
+        else:
+            self.agent.set_allowed_tools(
+                apply_main_agent_tool_filter([name for name, _ in self._tool_registry.items()])
+            )
         if self.agent_tool is not None:
             self.agent_tool.set_parent(self.agent)
         self.skill_executor.bind(self.provider, self.conv)
@@ -592,6 +620,16 @@ class LiCodeApp(App[None]):
             return None
         return WorktreeAdapter(self.worktree_mgr, self._set_active_cwd)
 
+    def team_accessor(self) -> TeamAdapter | None:
+        if self.team_mgr is None:
+            return None
+        return TeamAdapter(self.team_mgr)
+
+    async def on_lead_mail_message(self, message: LeadMailMessage) -> None:
+        del message
+        if self.state is SessionState.IDLE:
+            await begin_autonomous_turn(self)
+
     async def run_agent_events(self) -> AsyncIterator[AgentOutput]:
         if self.agent is None:
             raise RuntimeError("Agent 尚未初始化")
@@ -736,6 +774,10 @@ class LiCodeApp(App[None]):
                 self.provider.model,
                 self._usage_in,
                 self._usage_out,
+                self.coordinator_mode,
+                self.team_mgr.list_()[-1].sanitized_name
+                if self.team_mgr is not None and self.team_mgr.list_()
+                else "",
             )
         )
 
@@ -759,7 +801,12 @@ class LiCodeApp(App[None]):
             except asyncio.CancelledError:
                 pass
         await self.dispatch_session_end()
-        for consumer in (self._task_done_consumer, self._approval_consumer):
+        for consumer in (
+            self._task_done_consumer,
+            self._approval_consumer,
+            self._lead_mail_consumer,
+            self._lead_mail_waiter,
+        ):
             if consumer is not None:
                 consumer.cancel()
         self.exit()

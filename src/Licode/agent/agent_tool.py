@@ -6,7 +6,7 @@ import asyncio
 import json
 from contextlib import suppress
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from Licode.compact import (
     CompactCircuitBreaker,
@@ -25,6 +25,9 @@ from . import Agent, AgentOutput, Event, Phase, SessionRuntime
 from .agent_worktree import execute_with_worktree
 from .context import current_agent, current_conversation
 from .fork import build_forked_messages, is_fork_context
+
+if TYPE_CHECKING:
+    from .team_hook import TeamHook
 
 AUTO_BACKGROUND_SECONDS = 120.0
 
@@ -45,6 +48,8 @@ class AgentArgs:
     model: str = ""
     run_in_background: bool = False
     name: str = ""
+    team_name: str = ""
+    plan_mode_required: bool = False
 
 
 def is_sub_agent_context() -> bool:
@@ -88,12 +93,14 @@ class AgentTool:
         parent: Agent | None,
         bg_enabled: bool,
         worktree_mgr: WorktreeManager | None = None,
+        team_hook: TeamHook | None = None,
     ) -> None:
         self.catalog = catalog
         self.task_mgr = task_mgr
         self.parent = parent
         self.bg_enabled = bg_enabled
         self.worktree_mgr = worktree_mgr
+        self.team_hook = team_hook
 
     def set_parent(self, agent: Agent) -> None:
         self.parent = agent
@@ -105,6 +112,7 @@ class AgentTool:
         choices = ", ".join(item.name for item in self.catalog.list())
         return (
             "启动一个独立上下文的子 Agent；subagent_type 留空时 Fork 当前对话。"
+            " team_name 非空时把 Agent 作为指定 Team 的队员启动。"
             f" subagent_type 可选值: {choices}"
         )
 
@@ -118,6 +126,8 @@ class AgentTool:
                 "model": {"type": "string"},
                 "run_in_background": {"type": "boolean", "default": False},
                 "name": {"type": "string"},
+                "team_name": {"type": "string"},
+                "plan_mode_required": {"type": "boolean", "default": False},
             },
             "required": ["prompt", "description"],
             "additionalProperties": False,
@@ -138,17 +148,29 @@ class AgentTool:
             "model",
             "run_in_background",
             "name",
+            "team_name",
+            "plan_mode_required",
         }
         unknown = sorted(set(value) - known)
         if unknown:
             raise ValueError(f"未知参数: {', '.join(unknown)}")
-        for field_name in ("prompt", "description", "subagent_type", "model", "name"):
+        for field_name in (
+            "prompt",
+            "description",
+            "subagent_type",
+            "model",
+            "name",
+            "team_name",
+        ):
             field_value = value.get(field_name, "")
             if not isinstance(field_value, str):
                 raise ValueError(f"{field_name} 必须是字符串")
         background = value.get("run_in_background", False)
         if not isinstance(background, bool):
             raise ValueError("run_in_background 必须是布尔值")
+        plan_mode_required = value.get("plan_mode_required", False)
+        if not isinstance(plan_mode_required, bool):
+            raise ValueError("plan_mode_required 必须是布尔值")
         return AgentArgs(
             prompt=value.get("prompt", "").strip(),
             description=value.get("description", "").strip(),
@@ -156,9 +178,13 @@ class AgentTool:
             model=value.get("model", "").strip(),
             run_in_background=background,
             name=value.get("name", "").strip(),
+            team_name=value.get("team_name", "").strip(),
+            plan_mode_required=plan_mode_required,
         )
 
-    def _allowed_tools(self, definition: Definition, background: bool) -> list[str]:
+    def _allowed_tools(
+        self, definition: Definition, background: bool, *, teammate: bool = False
+    ) -> list[str]:
         assert self.parent is not None
         all_names = [name for name, _ in self.parent.registry.items()]
         filtered = apply_agent_tool_filter(
@@ -168,6 +194,7 @@ class AgentTool:
                 background=background,
                 allowed=definition.tools,
                 disallowed=definition.disallowed_tools,
+                teammate=teammate,
             )
         )
         if definition.is_fork() and "Agent" in all_names:
@@ -213,10 +240,43 @@ class AgentTool:
         if self.parent is None:
             return Result("Agent tool parent is not initialized", is_error=True)
 
+        if parsed.team_name:
+            if self.team_hook is None:
+                return Result("Team 管理器未配置", is_error=True)
+            team_name, member_name, in_process = self.team_hook.is_teammate_context()
+            if team_name:
+                if in_process:
+                    from Licode.team import InProcessTeammateNoSpawnError
+
+                    error = InProcessTeammateNoSpawnError(
+                        f"in-process 队员 {member_name} 不能向 Team 添加成员"
+                    )
+                    return Result(str(error), is_error=True)
+                return Result("Team 队员不能向 Team 添加成员", is_error=True)
+            from .team_hook import TeamSpawnRequest
+
+            try:
+                content = await self.team_hook.spawn_teammate(
+                    TeamSpawnRequest(
+                        team_name=parsed.team_name,
+                        member_name=parsed.name,
+                        prompt=parsed.prompt,
+                        description=parsed.description,
+                        subagent_type=parsed.subagent_type,
+                        model=parsed.model,
+                        plan_mode_required=parsed.plan_mode_required,
+                    )
+                )
+            except Exception as exc:
+                return Result(f"Team 队员启动失败: {exc}", is_error=True)
+            return Result(content)
+
         caller_conversation = current_conversation()
         if caller_conversation is not None and is_fork_context(caller_conversation.messages()):
             return Result("Fork 子 Agent 不能再启动 Agent", is_error=True)
-        if is_sub_agent_context():
+        teammate = self.team_hook.is_teammate_context() if self.team_hook is not None else None
+        pane_teammate = bool(teammate and teammate[0] and not teammate[2])
+        if is_sub_agent_context() and not pane_teammate:
             return Result("SubAgent 不能再启动 Agent", is_error=True)
 
         if parsed.subagent_type:

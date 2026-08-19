@@ -56,6 +56,7 @@ if TYPE_CHECKING:
 
     from .agent_tool import AgentTool
     from .permission_upgrade import ApprovalUpgrader
+    from .team_hook import TeammateContext
 
 MAX_ITERATIONS: int = 25
 MAX_UNKNOWN_RUN: int = 3
@@ -104,6 +105,8 @@ class Agent:
         approval_upgrader: ApprovalUpgrader | None = None,
         allowed_tools: list[str] | None = None,
         is_sub_agent: bool = False,
+        team_context: TeammateContext | None = None,
+        working_directory: str = "",
     ) -> None:
         self._provider = provider
         self._registry = registry
@@ -122,12 +125,15 @@ class Agent:
         self._hook_engine = hook_engine or self.runtime.hook_engine
         self.runtime.hook_engine = self._hook_engine
         self.system_prompt = system_prompt
+        self._system_prompt_suffixes: list[str] = []
         self.max_turns = max_turns
         self.permission_mode = permission_mode
         self.dont_ask = dont_ask
         self.approval_upgrader = approval_upgrader
         self.allowed_tools = list(allowed_tools) if allowed_tools is not None else None
         self.is_sub_agent = is_sub_agent
+        self.team_context = team_context
+        self.working_directory = working_directory
         self._current_conversation: Conversation | None = None
         self._run_lock = asyncio.Lock()
 
@@ -164,6 +170,16 @@ class Agent:
 
     def clear_active_skills(self) -> None:
         self.runtime.active_skills.clear()
+
+    def set_allowed_tools(self, tools: list[str]) -> None:
+        self.allowed_tools = list(tools)
+
+    def append_system_prompt(self, suffix: str) -> None:
+        if suffix.strip():
+            self._system_prompt_suffixes.append(suffix.strip())
+
+    def set_permission_mode(self, mode: Mode) -> None:
+        self.permission_mode = mode
 
     def list_active_skills(self) -> list[str]:
         return self.runtime.active_skills.names()
@@ -226,7 +242,12 @@ class Agent:
 
         from .run_to_completion import run_to_completion
 
-        return await run_to_completion(self, conv, task, events)
+        if not self.working_directory:
+            return await run_to_completion(self, conv, task, events)
+        from Licode.tool import with_cwd
+
+        with with_cwd(self.working_directory):
+            return await run_to_completion(self, conv, task, events)
 
     async def _run_locked(
         self, conv: Conversation, mode: Mode, cancel: asyncio.Event
@@ -249,19 +270,33 @@ class Agent:
             memory_text,
             skills_catalog,
         )
+        if self._system_prompt_suffixes:
+            stable_system += "\n\n" + "\n\n".join(self._system_prompt_suffixes)
         base_environment = environment.render()
 
         unknown_run = 0
         turns = self.max_turns or MAX_ITERATIONS
-        effective_mode = self.permission_mode or mode
         for iteration in range(1, turns + 1):
             yield Event(iter=iteration)
             if cancel.is_set():
                 self._ensure_assistant_tail(conv, NOTICE_CANCELLED)
                 return
 
+            from .team_mailbox import ingest_team_mailbox
+
+            await ingest_team_mailbox(self)
+            effective_mode = self.permission_mode or mode
+
             if effective_mode is Mode.PLAN:
                 definitions = self._registry.read_only_definitions()
+                if self.team_context is not None:
+                    # 计划模式仍须允许队员把计划提交给 Lead。
+                    existing = {item.name for item in definitions}
+                    definitions.extend(
+                        item
+                        for item in self._registry.definitions_filtered(["SendMessage"])
+                        if item.name not in existing
+                    )
             else:
                 definitions = self._registry.definitions()
             if self.allowed_tools is not None:
@@ -1018,6 +1053,8 @@ def new_agent(
     approval_upgrader: ApprovalUpgrader | None = None,
     allowed_tools: list[str] | None = None,
     is_sub_agent: bool = False,
+    team_context: TeammateContext | None = None,
+    working_directory: str = "",
 ) -> Agent:
     return Agent(
         provider,
@@ -1036,6 +1073,8 @@ def new_agent(
         approval_upgrader=approval_upgrader,
         allowed_tools=allowed_tools,
         is_sub_agent=is_sub_agent,
+        team_context=team_context,
+        working_directory=working_directory,
     )
 
 

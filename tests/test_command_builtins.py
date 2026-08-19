@@ -1,6 +1,14 @@
 import pytest
 
-from Licode.command import Kind, NopUI, Registry, WorktreeSummary, register_builtins
+from Licode.command import (
+    Kind,
+    NopUI,
+    Registry,
+    TeamMemberSummary,
+    TeamSummary,
+    WorktreeSummary,
+    register_builtins,
+)
 from Licode.permission import Mode
 
 
@@ -69,6 +77,40 @@ class WorktreeUI(RecordingUI):
         return self.accessor
 
 
+class StubTeamAccessor:
+    def __init__(self) -> None:
+        self.calls: list[tuple[object, ...]] = []
+        self.summary = TeamSummary(
+            "demo",
+            "in-process",
+            "C:/teams/demo/config.json",
+            [TeamMemberSummary("alice", "agent-1", "in-process", "C:/wt", "", False, 2)],
+        )
+
+    def list(self) -> list[TeamSummary]:
+        self.calls.append(("list",))
+        return [self.summary]
+
+    def info(self, name: str) -> TeamSummary:
+        self.calls.append(("info", name))
+        return self.summary
+
+    async def delete(self, name: str, force: bool) -> None:
+        self.calls.append(("delete", name, force))
+
+    async def kill(self, member: str) -> None:
+        self.calls.append(("kill", member))
+
+
+class TeamUI(RecordingUI):
+    def __init__(self) -> None:
+        super().__init__()
+        self.accessor = StubTeamAccessor()
+
+    def team_accessor(self) -> StubTeamAccessor:
+        return self.accessor
+
+
 def builtins() -> Registry:
     registry = Registry()
     register_builtins(registry)
@@ -93,6 +135,7 @@ def test_register_builtins_all_registered() -> None:
         "session",
         "skill",
         "status",
+        "team",
         "worktree",
     ]
 
@@ -167,7 +210,7 @@ async def test_handle_do_sets_mode_and_injects() -> None:
     assert "开始执行" in ui.injections[0][1]
 
 
-async def test_help_prints_fourteen_sorted_commands() -> None:
+async def test_help_prints_all_sorted_commands() -> None:
     ui = RecordingUI()
     command = builtins().lookup("help")
     assert command is not None
@@ -175,7 +218,7 @@ async def test_help_prints_fourteen_sorted_commands() -> None:
     await command.handler(ui)
 
     lines = ui.printed[0].splitlines()
-    assert len(lines) == 15
+    assert len(lines) == 16
     assert [line.split()[0] for line in lines] == [f"/{item.name}" for item in builtins().visible()]
 
 
@@ -205,3 +248,16 @@ async def test_handle_worktree_reports_unavailable() -> None:
     assert command is not None and command.args_handler is not None
     with pytest.raises(RuntimeError, match="不可用"):
         await command.args_handler(NopUI(), "list")
+
+
+async def test_handle_team_all_subcommands() -> None:
+    ui = TeamUI()
+    command = builtins().lookup("team")
+    assert command is not None and command.args_handler is not None
+    for args in ("list", "info demo", "delete demo --force", "kill alice"):
+        await command.args_handler(ui, args)
+    assert ("list",) in ui.accessor.calls
+    assert ("info", "demo") in ui.accessor.calls
+    assert ("delete", "demo", True) in ui.accessor.calls
+    assert ("kill", "alice") in ui.accessor.calls
+    assert any("tasks=2" in line for line in ui.printed)

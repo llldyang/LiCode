@@ -120,3 +120,21 @@ def test_context_window_must_be_integer(tmp_path: Path) -> None:
 def test_config_example_can_be_loaded() -> None:
     config = load(".Licode/config.yaml.example")
     assert config.providers[0].context_window == 200000
+
+
+def test_features_are_loaded(tmp_path: Path) -> None:
+    path = write_config(
+        tmp_path,
+        """providers:
+  - name: Test
+    protocol: openai
+    api_key: key
+    model: model
+features:
+  coordinator_mode: true
+  fork_teammate: true
+""",
+    )
+    config = load(path)
+    assert config.features.coordinator_mode is True
+    assert config.features.fork_teammate is True

@@ -111,6 +111,8 @@ def status_bar(
     model: str,
     usage_in: int = 0,
     usage_out: int = 0,
+    coordinator_mode: bool = False,
+    team_name: str = "",
 ) -> Table:
     labels = {
         Mode.DEFAULT: ("DEFAULT", "bold green"),
@@ -120,6 +122,10 @@ def status_bar(
     }
     label, style = labels[mode]
     left = Text(label, style=style)
+    if coordinator_mode:
+        left.append(" [COORDINATOR]", style="bold magenta")
+    if team_name:
+        left.append(f" [TEAM:{team_name}]", style="bold cyan")
     right = Text(model, style="dim")
     right.append(
         f"  ↑{_compact_tokens(usage_in)} ↓{_compact_tokens(usage_out)} tok",

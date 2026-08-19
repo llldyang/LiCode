@@ -28,9 +28,16 @@ class ProviderConfig:
 
 
 @dataclass
+class FeaturesConfig:
+    coordinator_mode: bool = False
+    fork_teammate: bool = False
+
+
+@dataclass
 class Config:
     providers: list[ProviderConfig] = field(default_factory=list)
     enable_subagent_background: bool | None = None
+    features: FeaturesConfig = field(default_factory=FeaturesConfig)
 
     def effective_enable_subagent_background(self) -> bool:
         """后台 SubAgent 默认启用；显式 false 时 Fork 也不可用。"""
@@ -94,7 +101,24 @@ def _from_dict(raw: Any) -> Config:
     )
     if background is not None and not isinstance(background, bool):
         raise ConfigError("enable_subagent_background 必须是布尔值")
-    return Config(providers=result, enable_subagent_background=background)
+    features_raw = raw.get("features", {})
+    if not isinstance(features_raw, dict):
+        raise ConfigError("features 必须是映射")
+    unknown_features = sorted(set(features_raw) - {"coordinator_mode", "fork_teammate"})
+    if unknown_features:
+        raise ConfigError(f"features 包含未知字段: {', '.join(unknown_features)}")
+    for feature_name in ("coordinator_mode", "fork_teammate"):
+        if feature_name in features_raw and not isinstance(features_raw[feature_name], bool):
+            raise ConfigError(f"features.{feature_name} 必须是布尔值")
+    features = FeaturesConfig(
+        coordinator_mode=features_raw.get("coordinator_mode", False),
+        fork_teammate=features_raw.get("fork_teammate", False),
+    )
+    return Config(
+        providers=result,
+        enable_subagent_background=background,
+        features=features,
+    )
 
 
 def load(path: str) -> Config:

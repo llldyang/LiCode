@@ -44,6 +44,7 @@ class Definition:
     dont_ask: bool = False
     background: bool = False
     isolation: str = ""
+    plan_mode_required: bool = False
     system_prompt: str = ""
     file_path: str = ""
     source: Source = Source.BUILTIN

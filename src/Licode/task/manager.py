@@ -6,6 +6,7 @@ import asyncio
 import secrets
 import sys
 import time
+from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass, field
 from enum import IntEnum
@@ -18,6 +19,7 @@ from Licode.permission import Outcome
 if TYPE_CHECKING:
     from Licode.agent import Agent, AgentOutput
     from Licode.conversation import Conversation
+    from Licode.team.registry import AgentNameRegistry
 
 
 class Status(IntEnum):
@@ -86,10 +88,12 @@ class TaskBusy(RuntimeError):
 class Manager:
     """管理当前进程中的后台 SubAgent。"""
 
-    def __init__(self) -> None:
+    def __init__(self, name_reg: AgentNameRegistry | None = None) -> None:
         self._lock = asyncio.Lock()
         self._tasks: dict[str, BackgroundTask] = {}
         self._by_name: dict[str, str] = {}
+        self._name_reg = name_reg
+        self._done_callbacks: list[Callable[[str], Awaitable[None]]] = []
         self._done: asyncio.Queue[str] = asyncio.Queue(maxsize=32)
         self._approvals: asyncio.Queue[ApprovalRequest] = asyncio.Queue(maxsize=32)
         self._counter = 0
@@ -104,6 +108,11 @@ class Manager:
     def list(self) -> list[BackgroundTask]:
         return sorted(self._tasks.values(), key=lambda item: item.start_time)
 
+    def get_by_name(self, name: str) -> BackgroundTask | None:
+        task_id = self._name_reg.resolve(name) if self._name_reg is not None else None
+        task_id = task_id or self._by_name.get(name)
+        return self.get(task_id) if task_id is not None else None
+
     def subscribe_done(self) -> asyncio.Queue[str]:
         return self._done
 
@@ -115,6 +124,16 @@ class Manager:
             self._tasks[task.id] = task
             if task.name:
                 self._by_name[task.name] = task.id
+                if self._name_reg is not None:
+                    self._name_reg.register(task.name, task.id)
+
+    def set_name_registry(self, registry: AgentNameRegistry) -> None:
+        self._name_reg = registry
+        for name, task_id in self._by_name.items():
+            registry.register(name, task_id)
+
+    def on_task_done(self, callback: Callable[[str], Awaitable[None]]) -> None:
+        self._done_callbacks.append(callback)
 
     def _notify_done(self, task_id: str) -> None:
         try:
@@ -174,6 +193,11 @@ class Manager:
         task.status = status
         task.end_time = time.monotonic()
         self._notify_done(task.id)
+        for callback in self._done_callbacks:
+            try:
+                await callback(task.id)
+            except Exception as exc:
+                print(f"task manager: 完成回调失败 {task.id}: {exc}", file=sys.stderr)
 
     async def launch(
         self,
@@ -241,14 +265,25 @@ class Manager:
             await asyncio.sleep(0)
         return True
 
-    async def send_message(self, name: str, message: str) -> str:
-        task_id = self._by_name.get(name)
-        task = self.get(task_id) if task_id is not None else None
+    async def send_message(
+        self,
+        name_or_context: object,
+        name_or_message: str,
+        message: str | None = None,
+    ) -> str:
+        # Team 调用链可携带 parent_ctx；第 13 章的二参数接口继续兼容。
+        if message is None:
+            name = str(name_or_context)
+            content = name_or_message
+        else:
+            name = name_or_message
+            content = message
+        task = self.get_by_name(name)
         if task is None:
             raise TaskNotFound(f"unknown task name: {name}")
-        if task.status is not Status.COMPLETED:
-            raise TaskBusy(f"task is not completed: {name}")
-        task.conv.add_user(message)
+        if task.status is Status.RUNNING:
+            raise TaskBusy(f"task is still running: {name}")
+        task.conv.add_user(content)
         task.status = Status.RUNNING
         task.result = ""
         task.err = None

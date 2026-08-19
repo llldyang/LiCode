@@ -87,5 +87,10 @@ async def consume_stream(app: "LiCodeApp") -> None:
         app._finish_with_error(exc)
 
 
+async def begin_autonomous_turn(app: "LiCodeApp") -> None:
+    text = "[team-update] 队员发来新消息，请按 Coordinator 流程处理..."
+    await app._start_turn(text, text)
+
+
 def tick(app: "LiCodeApp") -> None:
     app._refresh_streaming_view()

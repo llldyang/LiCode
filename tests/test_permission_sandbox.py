@@ -26,6 +26,16 @@ def test_sandbox_rejects_parent_escape(tmp_path: Path) -> None:
     assert not sandbox_ok(engine, str(tmp_path / "outside.txt"))
 
 
+def test_sandbox_allows_only_documented_system_temp_roots(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    engine = SimpleNamespace(root=resolve_root(str(root)))
+
+    assert sandbox_ok(engine, "/tmp/Licode-test.txt")
+    assert sandbox_ok(engine, "/private/tmp/Licode-test.txt")
+    assert not sandbox_ok(engine, "/etc/passwd")
+
+
 def test_sandbox_resolves_symlink_before_prefix_check(tmp_path: Path) -> None:
     root = tmp_path / "project"
     outside = tmp_path / "outside"

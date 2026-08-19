@@ -143,3 +143,25 @@ async def test_cancelling_approval_upgrade_propagates_cancellation() -> None:
     upgrade.cancel()
     with pytest.raises(asyncio.CancelledError):
         await upgrade
+
+
+@pytest.mark.asyncio
+async def test_name_registry_and_done_callbacks() -> None:
+    from Licode.team import AgentNameRegistry
+
+    registry = AgentNameRegistry()
+    manager = Manager(registry)
+    called: list[str] = []
+
+    async def on_done(task_id: str) -> None:
+        called.append(task_id)
+
+    manager.on_task_done(on_done)
+    task_id = await manager.launch(FakeAgent(), Conversation(), "alice", "task")
+    await asyncio.wait_for(manager.subscribe_done().get(), 1)
+    for _ in range(10):
+        if called:
+            break
+        await asyncio.sleep(0)
+    assert registry.resolve("alice") == task_id
+    assert called == [task_id]

@@ -10,6 +10,7 @@ from Licode.session import Writer
 from Licode.skills import Catalog
 from Licode.subagent import Catalog as SubagentCatalog
 from Licode.task import Manager as TaskManager
+from Licode.team import Manager as TeamManager
 from Licode.tool import Registry
 from Licode.tool.install_skill import InstallSkillTool
 from Licode.worktree import Manager as WorktreeManager
@@ -35,6 +36,8 @@ def new_app(
     subagent_catalog: SubagentCatalog | None = None,
     agent_tool: AgentTool | None = None,
     worktree_mgr: WorktreeManager | None = None,
+    team_mgr: TeamManager | None = None,
+    coordinator_mode: bool = False,
 ) -> LiCodeApp:
     return LiCodeApp(
         providers,
@@ -54,6 +57,8 @@ def new_app(
         subagent_catalog,
         agent_tool,
         worktree_mgr,
+        team_mgr,
+        coordinator_mode,
     )
 
 
