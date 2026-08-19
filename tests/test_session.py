@@ -41,6 +41,18 @@ def test_writer_append_and_read_with_model(tmp_path: Path) -> None:
     assert entries[2]["tool_results"][0]["content"] == "结果"
 
 
+def test_writer_flushes_and_fsyncs_every_append(tmp_path: Path, monkeypatch) -> None:
+    sync_calls: list[int] = []
+    monkeypatch.setattr("Licode.session.writer.os.fsync", sync_calls.append)
+
+    with Writer(str(tmp_path)) as writer:
+        writer.append(Message(role="user", content="第一条"), "fake-model", True)
+        assert "第一条" in (tmp_path / "conversation.jsonl").read_text(encoding="utf-8")
+        writer.append(Message(role="assistant", content="第二条"))
+
+    assert len(sync_calls) == 2
+
+
 def test_writer_callbacks_and_compact_marker(tmp_path: Path) -> None:
     with Writer(str(tmp_path)) as writer:
         writer.set_model("model")
@@ -86,6 +98,16 @@ def test_load_session_skips_bad_lines_and_orphaned_calls(tmp_path: Path) -> None
     )
 
     assert load_session(str(tmp_path)) == [Message(role="user", content="问题")]
+
+
+def test_load_session_ignores_incomplete_trailing_line(tmp_path: Path) -> None:
+    valid = json.dumps({"role": "user", "content": "完整消息", "ts": 1})
+    (tmp_path / "conversation.jsonl").write_text(
+        valid + "\n" + '{"role":"assistant","content":',
+        encoding="utf-8",
+    )
+
+    assert load_session(str(tmp_path)) == [Message(role="user", content="完整消息")]
 
 
 def test_writer_concurrent_append_has_no_lost_or_partial_lines(tmp_path: Path) -> None:

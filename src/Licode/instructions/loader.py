@@ -81,12 +81,21 @@ class Loader:
                     output.append(line)
                     continue
                 include_path = os.path.join(os.path.dirname(real_path), match.group(1))
-                expanded = self._load_file(
-                    include_path,
-                    real_boundary,
-                    depth + 1,
-                    visited,
-                )
+                if depth >= self.max_depth:
+                    expanded = (
+                        stripped
+                        + "\n"
+                        + "<!-- @include 超过最大嵌套深度，已跳过: "
+                        + include_path
+                        + " -->"
+                    )
+                else:
+                    expanded = self._load_file(
+                        include_path,
+                        real_boundary,
+                        depth + 1,
+                        visited,
+                    )
                 output.append(expanded)
                 if line.endswith(("\n", "\r")) and expanded and not expanded.endswith("\n"):
                     output.append("\n")

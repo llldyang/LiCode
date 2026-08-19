@@ -54,10 +54,12 @@ def open_session_context(workspace: str, session_id: str) -> SessionContext:
     session_dir = Path(workspace).resolve() / ".Licode" / "sessions" / session_id
     if not session_dir.is_dir():
         raise FileNotFoundError(f"会话目录不存在: {session_dir}")
+    spill_dir = session_dir / "tool-results"
+    spill_dir.mkdir(parents=True, exist_ok=True)
     return SessionContext(
         session_id=session_id,
         session_dir=str(session_dir),
-        spill_dir=str(session_dir / "tool-results"),
+        spill_dir=str(spill_dir),
     )
 
 

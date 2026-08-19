@@ -1,6 +1,7 @@
 import asyncio
 import json
 import threading
+import time
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -51,6 +52,7 @@ def test_store_create_update_delete_note(tmp_path: Path) -> None:
     assert "接口约定" in store.load_index()
 
     created = _frontmatter(path)["created"]
+    time.sleep(0.001)
     store.apply(
         [
             UpdateAction(
@@ -64,6 +66,7 @@ def test_store_create_update_delete_note(tmp_path: Path) -> None:
     )
     assert "使用 JSON API。" in path.read_text(encoding="utf-8")
     assert _frontmatter(path)["created"] == created
+    assert str(_frontmatter(path)["updated"]) > str(created)
     assert "新接口约定" in store.load_index()
 
     store.apply([UpdateAction(action="delete", level="project", filename=path.name)])
@@ -92,12 +95,20 @@ async def test_manager_update_async_parses_response_without_tools(tmp_path: Path
         [
             {
                 "action": "create",
+                "level": "project",
+                "type": "project_knowledge",
+                "title": "项目语言",
+                "slug": "project_language",
+                "content": "项目使用 Python。",
+            },
+            {
+                "action": "create",
                 "level": "user",
                 "type": "user_preference",
                 "title": "简洁回复",
                 "slug": "terse_replies",
                 "content": "用户偏好简洁回复。",
-            }
+            },
         ],
         ensure_ascii=False,
     )
@@ -106,9 +117,21 @@ async def test_manager_update_async_parses_response_without_tools(tmp_path: Path
 
     await manager.update_async([Message(role="user", content="记住简洁回复")])
 
+    assert (tmp_path / "project" / "project_knowledge_project_language.md").is_file()
     assert (tmp_path / "user" / "user_preference_terse_replies.md").is_file()
     assert provider.requests[0].tools is None
     assert "记住简洁回复" in provider.requests[0].messages[0].content
+
+
+async def test_manager_update_failure_is_logged_and_suppressed(tmp_path: Path, caplog) -> None:
+    provider = FakeProvider("不是 JSON")
+    manager = Manager(str(tmp_path / "project"), str(tmp_path / "user"), provider, "fake")
+
+    await manager.update_async([Message(role="user", content="记住失败场景")])
+
+    assert "自动记忆更新失败" in caplog.text
+    assert not (tmp_path / "project").exists()
+    assert not (tmp_path / "user").exists()
 
 
 def test_store_concurrent_apply_keeps_all_notes(tmp_path: Path) -> None:

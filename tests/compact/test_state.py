@@ -19,6 +19,16 @@ def test_new_session_context_creates_unique_directories(tmp_path: Path) -> None:
     assert parse_session_time(first.session_id).strftime("%Y%m%d-%H%M%S") == first.session_id[:15]
 
 
+def test_open_session_context_recreates_missing_spill_directory(tmp_path: Path) -> None:
+    session_id = "20260819-120000-abcd"
+    session_dir = tmp_path / ".Licode" / "sessions" / session_id
+    session_dir.mkdir(parents=True)
+
+    context = open_session_context(str(tmp_path), session_id)
+
+    assert Path(context.spill_dir).is_dir()
+
+
 def test_new_session_context_random_fallback(tmp_path: Path, monkeypatch) -> None:
     def fail(_: int) -> str:
         raise RuntimeError("随机源不可用")

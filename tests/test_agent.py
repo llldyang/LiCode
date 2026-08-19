@@ -121,6 +121,19 @@ class FakeMemoryManager:
         self.updated.set()
 
 
+class BlockingMemoryManager(FakeMemoryManager):
+    def __init__(self) -> None:
+        super().__init__()
+        self.release = asyncio.Event()
+        self.finished = asyncio.Event()
+
+    async def update_async(self, messages: list[Message]) -> None:
+        self.calls.append(messages)
+        self.updated.set()
+        await self.release.wait()
+        self.finished.set()
+
+
 def tool_event(call_id: str, name: str = "probe", args: str = "{}") -> list[StreamEvent]:
     return [
         StreamEvent(tool_calls=[ToolCall(id=call_id, name=name, input=args)]),
@@ -216,6 +229,37 @@ async def test_agent_updates_memory_every_five_turns(tmp_path: Path) -> None:
     assert agent.runtime.turn_count == 5
     assert len(memory_manager.calls) == 1
     assert memory_manager.calls[0][0].content == "问题 4"
+
+
+@pytest.mark.asyncio
+async def test_memory_update_does_not_block_next_agent_run(tmp_path: Path) -> None:
+    provider = FakeProvider(
+        [
+            [StreamEvent(text="已记住"), StreamEvent(done=True)],
+            [StreamEvent(text="下一轮完成"), StreamEvent(done=True)],
+        ]
+    )
+    memory_manager = BlockingMemoryManager()
+    agent = Agent(
+        provider,
+        Registry(),
+        "test",
+        permission_engine(tmp_path),
+        runtime=session_runtime(tmp_path),
+        memory_manager=memory_manager,  # type: ignore[arg-type]
+    )
+    conversation = Conversation()
+    conversation.add_user("请记住这个偏好")
+    _ = [event async for event in agent.run(conversation, Mode.DEFAULT, asyncio.Event())]
+    await asyncio.wait_for(memory_manager.updated.wait(), timeout=1)
+
+    conversation.add_user("立即处理下一轮")
+    _ = [event async for event in agent.run(conversation, Mode.DEFAULT, asyncio.Event())]
+    assert provider.call_count == 2
+    assert not memory_manager.finished.is_set()
+
+    memory_manager.release.set()
+    await asyncio.wait_for(memory_manager.finished.wait(), timeout=1)
 
 
 @pytest.mark.asyncio

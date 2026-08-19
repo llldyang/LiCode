@@ -45,6 +45,7 @@ def test_include_depth_is_limited_to_five_levels(tmp_path: Path) -> None:
     output = Loader(str(tmp_path), str(tmp_path / "home")).load()
 
     assert "第六层" not in output
+    assert "@include 5.md" in output
     assert "超过最大嵌套深度" in output
 
 
