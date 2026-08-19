@@ -1,5 +1,7 @@
 import asyncio
+import ctypes
 import os
+import sys
 import time
 from contextlib import AbstractAsyncContextManager
 from types import SimpleNamespace
@@ -7,6 +9,8 @@ from typing import Any
 
 import mcp.types as mtypes
 import pytest
+from mcp.server import MCPServer
+from mcp.server.transport_security import TransportSecuritySettings
 
 from Licode.mcp import Config, ServerConfig
 from Licode.mcp import manager as manager_module
@@ -21,6 +25,24 @@ class EmptyCaller:
 
 def local_tool(name: str) -> McpTool:
     return McpTool(name, "remote", "description", {"type": "object"}, False, EmptyCaller())
+
+
+def process_is_running(pid: int) -> bool:
+    """跨平台检查测试子进程，Windows 下不发送可能终止进程的信号。"""
+
+    if os.name == "nt":
+        process_query_limited_information = 0x1000
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(process_query_limited_information, False, pid)
+        if not handle:
+            return False
+        kernel32.CloseHandle(handle)
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
 
 
 @pytest.mark.asyncio
@@ -169,3 +191,108 @@ async def test_stdio_connect_initializes_lists_and_adapts(monkeypatch, capsys) -
     assert "skip tool mcp__demo__bad.name" in error
     assert "connected server demo: 1 tools" in error
     await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_real_stdio_server_handshake_call_env_and_shutdown(tmp_path) -> None:
+    server_script = tmp_path / "stdio_server.py"
+    server_script.write_text(
+        "from mcp.server import MCPServer\n"
+        "import os\n"
+        "server = MCPServer('stdio-test')\n"
+        "@server.tool()\n"
+        "def inspect_env(text: str) -> str:\n"
+        "    return f\"{os.environ.get('MCP_TEST_ENV')}|{text}|{os.getpid()}\"\n"
+        "server.run()\n",
+        encoding="utf-8",
+    )
+    manager = await new_manager(
+        Config(
+            {
+                "stdio": ServerConfig(
+                    type="stdio",
+                    command=sys.executable,
+                    args=[str(server_script)],
+                    env={"MCP_TEST_ENV": "injected"},
+                )
+            }
+        ),
+        "test",
+    )
+
+    try:
+        [tool] = manager.tools()
+        result = await tool.execute('{"text": "hello"}')
+        injected, text, raw_pid = result.content.split("|")
+        pid = int(raw_pid)
+        assert (tool.full_name, injected, text, result.is_error) == (
+            "mcp__stdio__inspect_env",
+            "injected",
+            "hello",
+            False,
+        )
+        assert process_is_running(pid)
+    finally:
+        await manager.close()
+
+    deadline = time.monotonic() + 3
+    while process_is_running(pid) and time.monotonic() < deadline:
+        await asyncio.sleep(0.02)
+    assert not process_is_running(pid)
+    assert all(task.done() for task in manager._tasks)
+
+
+@pytest.mark.asyncio
+async def test_real_http_server_receives_headers_on_every_request(monkeypatch) -> None:
+    import httpx2
+
+    server = MCPServer("http-test")
+
+    @server.tool()
+    def echo(text: str) -> str:
+        return text
+
+    app = server.streamable_http_app(
+        json_response=True,
+        stateless_http=True,
+        transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+    )
+    received_headers: list[dict[bytes, bytes]] = []
+
+    async def capture_headers(scope, receive, send):
+        if scope["type"] == "http":
+            received_headers.append(dict(scope["headers"]))
+        await app(scope, receive, send)
+
+    original_client = httpx2.AsyncClient
+
+    def asgi_client(*args, **kwargs):
+        # 保留生产代码设置的默认 headers，只把网络传输替换为进程内 ASGI。
+        kwargs["transport"] = httpx2.ASGITransport(app=capture_headers)
+        return original_client(*args, **kwargs)
+
+    monkeypatch.setattr(httpx2, "AsyncClient", asgi_client)
+    async with app.router.lifespan_context(app):
+        manager = await new_manager(
+            Config(
+                {
+                    "http": ServerConfig(
+                        type="http",
+                        url="http://127.0.0.1/mcp",
+                        headers={"Authorization": "Bearer test-token"},
+                    )
+                }
+            ),
+            "test",
+        )
+        try:
+            [tool] = manager.tools()
+            result = await tool.execute('{"text": "hello"}')
+            assert tool.full_name == "mcp__http__echo"
+            assert result.content == "hello"
+            assert result.is_error is False
+        finally:
+            await manager.close()
+
+    assert received_headers
+    assert all(headers[b"authorization"] == b"Bearer test-token" for headers in received_headers)

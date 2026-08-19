@@ -5,7 +5,7 @@ import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 import yaml
 
@@ -124,7 +124,8 @@ def _string_map(value: Any) -> dict[str, str] | None:
 
 
 def _validate_server(name: str, server: _RawServer) -> ServerConfig | None:
-    if server.type not in {"stdio", "http"}:
+    # YAML 允许 list/map 等任意值；先判类型，保证坏配置始终按单项降级。
+    if not isinstance(server.type, str) or server.type not in {"stdio", "http"}:
         _warn(f"skip server {name}: type must be stdio or http")
         return None
     if server.type == "stdio" and (not isinstance(server.command, str) or not server.command):
@@ -145,7 +146,7 @@ def _validate_server(name: str, server: _RawServer) -> ServerConfig | None:
         _warn(f"skip server {name}: headers must be a string mapping")
         return None
     return ServerConfig(
-        type=server.type,
+        type=cast(Literal["stdio", "http"], server.type),
         command=server.command if isinstance(server.command, str) else "",
         args=list(server.args),
         env=env,

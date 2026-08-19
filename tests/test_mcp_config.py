@@ -112,6 +112,7 @@ def test_invalid_servers_are_skipped_independently(tmp_path: Path, monkeypatch, 
         "mcp_servers:\n"
         "  missing-type: {command: python}\n"
         "  bad-type: {type: socket}\n"
+        "  non-string-type: {type: [stdio], command: python}\n"
         "  missing-command: {type: stdio}\n"
         "  missing-url: {type: http}\n"
         "  bad-args: {type: stdio, command: python, args: value}\n"
@@ -123,7 +124,7 @@ def test_invalid_servers_are_skipped_independently(tmp_path: Path, monkeypatch, 
     error = capsys.readouterr().err
 
     assert set(config.servers) == {"good"}
-    assert error.count("[mcp] warn: skip server") == 5
+    assert error.count("[mcp] warn: skip server") == 6
 
 
 def test_home_resolution_failure_does_not_hide_project_config(
