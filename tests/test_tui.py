@@ -34,7 +34,7 @@ from Licode.session import Writer, list_sessions
 from Licode.tool import new_default_registry
 from Licode.tui.app import LiCodeApp, MessageInput, SessionState
 from Licode.tui.complete import MAX_ROWS, CompletionMenu
-from Licode.tui.view import format_compact_notice
+from Licode.tui.view import format_compact_notice, tool_result_summary
 
 
 class FakeProvider:
@@ -133,6 +133,17 @@ def rendered_status(app: LiCodeApp) -> str:
     console = Console(file=output, width=120, color_system=None)
     console.print(status.content)
     return output.getvalue()
+
+
+def test_tool_result_summary_limits_scrollback_noise() -> None:
+    rendered = tool_result_summary("\n".join(f"第 {index} 行" for index in range(1, 11)), False)
+    output = io.StringIO()
+    Console(file=output, width=120, color_system=None).print(rendered)
+
+    text = output.getvalue()
+    assert "第 8 行" in text
+    assert "第 9 行" not in text
+    assert "[truncated]" in text
 
 
 async def wait_for_state(pilot: Pilot[None], app: LiCodeApp, expected: SessionState) -> None:
