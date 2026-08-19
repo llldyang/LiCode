@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from enum import Enum
 
@@ -43,6 +44,7 @@ class ManageInput:
     anchor_msg_len: int
     estimated_token: int
     trigger: TriggerKind
+    before_layer2: Callable[[], Awaitable[None]] | None = None
 
 
 @dataclass
@@ -94,6 +96,8 @@ async def manage_context(in_: ManageInput) -> ManageOutput:
                 if layer1_estimate < threshold or in_.auto_tracking.tripped():
                     after = layer1_estimate
                 else:
+                    if in_.before_layer2 is not None:
+                        await in_.before_layer2()
                     auto_input = ManageInput(
                         **{
                             **in_.__dict__,

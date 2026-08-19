@@ -176,6 +176,26 @@ class ControlledProvider(FakeProvider):
         yield StreamEvent(done=True)
 
 
+class DelayedSummaryProvider(FakeProvider):
+    def __init__(self) -> None:
+        super().__init__([])
+        self.summary_started = asyncio.Event()
+        self.release_summary = asyncio.Event()
+
+    async def stream(self, req: Request) -> AsyncIterator[StreamEvent]:
+        self.requests.append(req)
+        self.call_count += 1
+        if req.tools is None:
+            self.summary_started.set()
+            await self.release_summary.wait()
+            summary = "<summary>" + "\n".join(f"## {i} 小节" for i in range(1, 10))
+            yield StreamEvent(text=summary + "</summary>")
+            yield StreamEvent(done=True)
+            return
+        yield StreamEvent(text="完成")
+        yield StreamEvent(done=True)
+
+
 class CancellableProvider(FakeProvider):
     def __init__(self) -> None:
         super().__init__([])
@@ -219,6 +239,31 @@ async def test_basic_chat_input_is_disabled_until_stream_finishes(
         assert provider.requests[0].messages[0].content == "第一行\n第二行"
         assert app.conv.messages()[-1].content == "**完成**"
         assert "完成于" in app._transcript[-1].renderables[-1].plain
+
+
+@pytest.mark.asyncio
+async def test_finished_stream_is_exhausted_before_consumer_returns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    provider = FakeProvider([[StreamEvent(text="完成"), StreamEvent(done=True)]])
+    app = make_app(tmp_path, monkeypatch, provider)
+    exhausted = asyncio.Event()
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        original = app.run_agent_events
+
+        async def tracked_events():
+            try:
+                async for event in original():
+                    yield event
+            finally:
+                exhausted.set()
+
+        app.run_agent_events = tracked_events  # type: ignore[method-assign]
+        await app.submit("检查流清理")
+        await wait_for_state(pilot, app, SessionState.IDLE)
+        await asyncio.wait_for(exhausted.wait(), timeout=1)
 
 
 @pytest.mark.asyncio
@@ -967,6 +1012,33 @@ async def test_tui_renders_auto_compact_notices(
 
 
 @pytest.mark.asyncio
+async def test_tui_shows_auto_notice_before_summary_returns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    provider = DelayedSummaryProvider()
+    app = make_app(tmp_path, monkeypatch, provider)
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.runtime.context_window = 60000
+        for _ in range(10):
+            app.conv.add_user("u" * 7000)
+            app.conv.add_assistant("a" * 7000)
+        await app.submit("继续")
+        await asyncio.wait_for(provider.summary_started.wait(), timeout=1)
+        await pilot.pause()
+
+        notices = [getattr(item, "plain", "") for item in app._transcript]
+        assert "正在压缩上下文..." in notices
+        assert not any("已压缩，token 从" in notice for notice in notices)
+
+        provider.release_summary.set()
+        await wait_for_state(pilot, app, SessionState.IDLE)
+        notices = [getattr(item, "plain", "") for item in app._transcript]
+        assert any("已压缩，token 从" in notice for notice in notices)
+
+
+@pytest.mark.asyncio
 async def test_tui_renders_emergency_compact_notices(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -988,6 +1060,29 @@ async def test_tui_renders_emergency_compact_notices(
         assert "上下文撞墙，自动压缩中..." in notices
         assert any("已压缩，token 从" in notice for notice in notices)
         assert provider.call_count == 3
+
+
+@pytest.mark.asyncio
+async def test_tui_renders_emergency_compact_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ptl = PromptTooLongError("摘要仍然过长")
+    provider = FakeProvider(
+        [
+            [StreamEvent(err=PromptTooLongError("主请求过长"))],
+            [StreamEvent(err=ptl)],
+        ]
+    )
+    app = make_app(tmp_path, monkeypatch, provider)
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app.submit("触发失败的紧急压缩")
+        await wait_for_state(pilot, app, SessionState.IDLE)
+        notices = [getattr(item, "plain", "") for item in app._transcript]
+        assert "上下文撞墙，自动压缩中..." in notices
+        assert any("压缩失败" in notice and "摘要仍然过长" in notice for notice in notices)
+        assert provider.call_count == 2
 
 
 @pytest.mark.asyncio

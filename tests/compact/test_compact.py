@@ -5,7 +5,7 @@ import pytest
 from Licode.compact import CompactCircuitBreaker, ContentReplacementState, TriggerKind
 from Licode.compact.compact import manage_context
 from Licode.conversation import Conversation
-from Licode.llm import Message, StreamEvent, ToolResult
+from Licode.llm import Message, PromptTooLongError, StreamEvent, ToolResult
 
 from .conftest import FakeCompactProvider, make_input, summary_text
 
@@ -153,6 +153,69 @@ async def test_auto_failures_trip_and_success_resets(tmp_path: Path) -> None:
         )
     )
     assert skipped.requests == []
+
+
+@pytest.mark.asyncio
+async def test_auto_failure_counter_resets_in_required_sequence(tmp_path: Path) -> None:
+    tracking = CompactCircuitBreaker()
+    observed: list[int] = []
+    scripts = [
+        [StreamEvent(err=RuntimeError("失败 1"))],
+        [StreamEvent(err=RuntimeError("失败 2"))],
+        [StreamEvent(text=summary_text()), StreamEvent(done=True)],
+        [StreamEvent(err=RuntimeError("失败 3"))],
+        [StreamEvent(err=RuntimeError("失败 4"))],
+        [StreamEvent(err=RuntimeError("失败 5"))],
+    ]
+
+    for script in scripts:
+        conversation = Conversation()
+        conversation.add_user("x" * 240000)
+        provider = FakeCompactProvider([script])
+        try:
+            await manage_context(
+                make_input(
+                    tmp_path,
+                    provider,
+                    conversation,
+                    estimated=70000,
+                    context_window=100000,
+                    tracking=tracking,
+                )
+            )
+        except RuntimeError:
+            pass
+        observed.append(tracking._consecutive_failures)
+
+    assert observed == [1, 2, 0, 1, 2, 3]
+    assert tracking.tripped()
+
+
+@pytest.mark.asyncio
+async def test_exhausted_summary_ptl_counts_as_one_auto_failure(tmp_path: Path) -> None:
+    tracking = CompactCircuitBreaker()
+    error = PromptTooLongError("摘要仍然过长")
+
+    for _ in range(3):
+        conversation = Conversation()
+        conversation.add_user("a" * 120000)
+        conversation.add_assistant("上一轮")
+        conversation.add_user("b" * 120000)
+        provider = FakeCompactProvider([[StreamEvent(err=error)], [StreamEvent(err=error)]])
+        with pytest.raises(PromptTooLongError):
+            await manage_context(
+                make_input(
+                    tmp_path,
+                    provider,
+                    conversation,
+                    estimated=70000,
+                    context_window=100000,
+                    tracking=tracking,
+                )
+            )
+
+    assert tracking._consecutive_failures == 3
+    assert tracking.tripped()
 
 
 @pytest.mark.asyncio

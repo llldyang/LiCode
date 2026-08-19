@@ -22,7 +22,7 @@ from Licode.compact import (
     manage_context,
     new_session_context,
 )
-from Licode.compact.const import AUTO_SAFETY_MARGIN, MANUAL_SAFETY_MARGIN, SUMMARY_RESERVE
+from Licode.compact.const import MANUAL_SAFETY_MARGIN
 from Licode.compact.token import estimate_tokens, usage_anchor
 from Licode.conversation import Conversation
 from Licode.hook import DispatchResult
@@ -281,17 +281,22 @@ class Agent:
                 mode,
                 trigger="auto",
             )
-            auto_threshold = manage_input.context_window - SUMMARY_RESERVE - AUTO_SAFETY_MARGIN
-            will_summarize = (
-                manage_input.context_window > SUMMARY_RESERVE + AUTO_SAFETY_MARGIN
-                and manage_input.estimated_token >= auto_threshold
-                and not self.runtime.auto_tracking.tripped()
-            )
-            if will_summarize:
-                yield Event(compact=CompactEvent(phase=CompactPhase.BEFORE_AUTO))
+            compact_queue: asyncio.Queue[Event] = asyncio.Queue(maxsize=1)
+            auto_started = False
+
+            async def before_auto_summary() -> None:
+                # 第一层落盘并重算 token 后，只有真正开始摘要才通知界面。
+                nonlocal auto_started
+                auto_started = True
+                await compact_queue.put(Event(compact=CompactEvent(phase=CompactPhase.BEFORE_AUTO)))
+
+            manage_input.before_layer2 = before_auto_summary
             compact_error: Exception | None = None
+            compact_task = asyncio.create_task(manage_context(manage_input))
             try:
-                manage_output = await manage_context(manage_input)
+                async for compact_event in self._drain(compact_task, compact_queue):
+                    yield compact_event
+                manage_output = await compact_task
             except Exception as exc:
                 compact_error = exc
                 manage_output = ManageOutput(
@@ -299,7 +304,9 @@ class Agent:
                     after_tokens=manage_input.estimated_token,
                 )
                 logger.warning("自动压缩失败，本轮继续使用可用历史: %s", exc)
-            if will_summarize:
+            finally:
+                await self._stop_task(compact_task)
+            if auto_started:
                 yield Event(
                     compact=CompactEvent(
                         phase=CompactPhase.AFTER_AUTO,

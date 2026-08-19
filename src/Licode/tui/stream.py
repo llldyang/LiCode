@@ -71,7 +71,8 @@ async def consume_stream(app: "LiCodeApp") -> None:
                     app._finish_with_assistant(app.cur_reply)
                 else:
                     app._finish_turn()
-                return
+                # 继续拉取一次让上游生成器在当前任务内退出并完成 ContextVar 清理。
+                continue
             if event.text:
                 app.cur_reply += event.text
                 app._refresh_streaming_view()

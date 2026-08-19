@@ -36,6 +36,7 @@ from Licode.llm import (
     StreamEvent,
     ToolCall,
     ToolDefinition,
+    ToolResult,
     Usage,
 )
 from Licode.permission import Decision, Engine, Mode, Outcome, new_engine
@@ -85,6 +86,26 @@ class ProbeTool:
 
     async def execute(self, args: str) -> Result:
         return Result(content="probe:" + (args or "{}"))
+
+
+class FixedResultTool:
+    read_only = True
+
+    def __init__(self, content: str) -> None:
+        self.content = content
+
+    def name(self) -> str:
+        return "fixed_result"
+
+    def description(self) -> str:
+        return "返回固定测试内容"
+
+    def parameters(self) -> dict[str, Any]:
+        return {"type": "object", "properties": {}}
+
+    async def execute(self, args: str) -> Result:
+        del args
+        return Result(content=self.content)
 
 
 class FakeMemoryManager:
@@ -819,6 +840,177 @@ async def test_agent_has_no_compact_event_below_threshold(tmp_path: Path) -> Non
 
 
 @pytest.mark.asyncio
+async def test_layer1_reduction_does_not_emit_layer2_events(tmp_path: Path) -> None:
+    provider = FakeProvider([[StreamEvent(text="完成"), StreamEvent(done=True)]])
+    conversation = Conversation()
+    conversation.replace_history(
+        [Message(role="tool", tool_results=[ToolResult("large", "x" * 240000)])]
+    )
+    events = [
+        event
+        async for event in Agent(
+            provider,
+            Registry(),
+            "test",
+            permission_engine(tmp_path),
+            runtime=session_runtime(tmp_path, context_window=100000),
+        ).run(conversation, Mode.DEFAULT, asyncio.Event())
+    ]
+
+    assert provider.call_count == 1
+    assert not any(event.compact is not None for event in events)
+    assert "[content offloaded]" in provider.requests[0].messages[0].tool_results[0].content
+
+
+@pytest.mark.asyncio
+async def test_agent_offloads_80kb_result_before_next_request(tmp_path: Path) -> None:
+    content = "x" * 80000
+    call = ToolCall("large-result", "fixed_result", "{}")
+    provider = FakeProvider(
+        [
+            [StreamEvent(tool_calls=[call]), StreamEvent(done=True)],
+            [StreamEvent(text="完成"), StreamEvent(done=True)],
+        ]
+    )
+    registry = Registry()
+    registry.register(FixedResultTool(content))
+    runtime = session_runtime(tmp_path)
+    conversation = Conversation()
+    conversation.add_user("读取大结果")
+
+    events = [
+        event
+        async for event in Agent(
+            provider,
+            registry,
+            "test",
+            permission_engine(tmp_path),
+            runtime=runtime,
+        ).run(conversation, Mode.BYPASS, asyncio.Event())
+    ]
+
+    assert events[-1].done
+    preview = provider.requests[1].messages[-1].tool_results[0].content
+    spill_path = Path(runtime.session.spill_dir) / call.id
+    assert "original size: 80000" in preview
+    assert "[saved to]" in preview and str(spill_path) in preview
+    assert "[head preview]" in preview
+    assert "文件读取工具" in preview and "不要凭头部预览猜测" in preview
+    assert spill_path.stat().st_size == 80000
+
+
+@pytest.mark.asyncio
+async def test_agent_completes_30_turn_long_session_with_compaction(tmp_path: Path) -> None:
+    class LongSessionProvider:
+        def __init__(self) -> None:
+            self.main_calls = 0
+            self.summary_calls = 0
+
+        @property
+        def name(self) -> str:
+            return "long-session"
+
+        @property
+        def model(self) -> str:
+            return "long-session-model"
+
+        async def stream(self, request: Request) -> AsyncIterator[StreamEvent]:
+            if request.tools is None:
+                self.summary_calls += 1
+                yield StreamEvent(text=compact_summary())
+                yield StreamEvent(done=True)
+                return
+            self.main_calls += 1
+            yield StreamEvent(
+                tool_calls=[ToolCall(f"long-{self.main_calls}", "fixed_result", "{}")]
+            )
+            yield StreamEvent(done=True)
+
+    provider = LongSessionProvider()
+    registry = Registry()
+    registry.register(FixedResultTool("r" * 30000))
+    conversation = Conversation()
+    conversation.add_user("连续执行三十轮")
+    events = [
+        event
+        async for event in Agent(
+            provider,
+            registry,
+            "test",
+            permission_engine(tmp_path),
+            runtime=session_runtime(tmp_path, context_window=50000),
+            max_turns=30,
+        ).run(conversation, Mode.BYPASS, asyncio.Event())
+    ]
+
+    assert events[-1].done
+    assert provider.main_calls == 30
+    assert provider.summary_calls >= 1
+    assert conversation.length() < 15
+
+
+@pytest.mark.asyncio
+async def test_compacted_request_restores_latest_files_and_exact_tools(tmp_path: Path) -> None:
+    summary = compact_summary().replace("</summary>", "\n原始请求一\n原始请求二</summary>")
+    provider = FakeProvider(
+        [
+            [StreamEvent(text=summary), StreamEvent(done=True)],
+            [StreamEvent(text="恢复后完成"), StreamEvent(done=True)],
+        ]
+    )
+    runtime = session_runtime(tmp_path, context_window=60000)
+    paths = [tmp_path / f"file-{index}.txt" for index in range(7)]
+    for index, path in enumerate(paths):
+        runtime.recovery.record_file(str(path), f"content-{index}")
+        await asyncio.sleep(0.001)
+
+    conversation = Conversation()
+    conversation.add_user("原始请求一")
+    conversation.add_assistant("x" * 140000)
+    conversation.add_user("原始请求二")
+    conversation.add_assistant("y" * 140000)
+    registry = new_default_registry()
+    events = [
+        event
+        async for event in Agent(
+            provider,
+            registry,
+            "test",
+            permission_engine(tmp_path),
+            runtime=runtime,
+        ).run(conversation, Mode.DEFAULT, asyncio.Event())
+    ]
+
+    assert events[-1].done
+    recovery_text = provider.requests[1].messages[0].content
+    assert "原始请求一" in recovery_text and "原始请求二" in recovery_text
+    expected_paths = [str(path.resolve()) for path in reversed(paths[2:])]
+    assert all(path in recovery_text for path in expected_paths)
+    assert str(paths[0].resolve()) not in recovery_text
+    assert str(paths[1].resolve()) not in recovery_text
+    assert [recovery_text.index(path) for path in expected_paths] == sorted(
+        recovery_text.index(path) for path in expected_paths
+    )
+
+    definitions = provider.requests[1].tools or []
+    tool_block = recovery_text.split("## 当前可用工具\n", 1)[1].split("\n\n## 边界提示", 1)[0]
+    assert tool_block.count("input_schema:") == len(definitions)
+    assert {definition.name for definition in definitions} == {
+        line.split(":", 1)[0][2:] for line in tool_block.splitlines() if line.startswith("- ")
+    }
+    for definition in definitions:
+        schema = json.dumps(
+            definition.input_schema,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        assert f"- {definition.name}:" in tool_block
+        assert f"input_schema: {schema}" in tool_block
+    assert "需要文件原文、错误原文或用户原话时" in recovery_text
+
+
+@pytest.mark.asyncio
 async def test_agent_emergency_compact_retries_once(tmp_path: Path) -> None:
     ptl = PromptTooLongError("主请求过长")
     provider = FakeProvider(
@@ -877,6 +1069,40 @@ async def test_agent_second_prompt_too_long_is_not_retried(tmp_path: Path) -> No
     assert provider.call_count == 3
     assert any(event.err is ptl for event in events)
     assert not events[-1].done
+
+
+@pytest.mark.asyncio
+async def test_agent_does_not_retry_when_emergency_output_is_still_too_large(
+    tmp_path: Path,
+) -> None:
+    ptl = PromptTooLongError("主请求过长")
+    oversized_summary = "<summary>" + "摘" * 50000 + "</summary>"
+    provider = FakeProvider(
+        [
+            [StreamEvent(err=ptl)],
+            [StreamEvent(text=oversized_summary), StreamEvent(done=True)],
+        ]
+    )
+    runtime = session_runtime(tmp_path, context_window=34000)
+    runtime.usage_anchor = 99
+    runtime.anchor_msg_len = 1
+    conversation = Conversation()
+    conversation.add_user("继续任务")
+    events = [
+        event
+        async for event in Agent(
+            provider,
+            Registry(),
+            "test",
+            permission_engine(tmp_path),
+            runtime=runtime,
+        ).run(conversation, Mode.DEFAULT, asyncio.Event())
+    ]
+
+    assert provider.call_count == 2
+    assert any(event.err is ptl for event in events)
+    assert runtime.usage_anchor == 0
+    assert runtime.anchor_msg_len == 0
 
 
 @pytest.mark.asyncio

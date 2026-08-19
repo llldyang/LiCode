@@ -3,6 +3,7 @@ from pathlib import Path
 import pytest
 
 from Licode.compact import CompactCircuitBreaker, TriggerKind
+from Licode.compact.const import ESTIMATE_CHARS_PER_TOKEN
 from Licode.compact.layer2 import (
     _join_after_summary,
     force_compact,
@@ -11,7 +12,7 @@ from Licode.compact.layer2 import (
     ptl_retry,
     run_summary,
 )
-from Licode.compact.token import estimate_tokens
+from Licode.compact.token import estimate_tokens, message_chars
 from Licode.conversation import Conversation
 from Licode.llm import Message, PromptTooLongError, StreamEvent, ToolCall, ToolResult
 
@@ -47,6 +48,9 @@ def test_pick_recent_tail_moves_before_tool_result_pair() -> None:
     assert recent[0].role == "assistant"
     assert recent[0].tool_calls[0].id == "call-a"
     assert recent[1].tool_results[0].tool_call_id == "call-a"
+    assert len(recent) >= 5
+    assert message_chars(recent) / ESTIMATE_CHARS_PER_TOKEN >= 10000
+    assert len(recent) <= len(messages)
 
 
 def test_join_after_summary_avoids_consecutive_user() -> None:
